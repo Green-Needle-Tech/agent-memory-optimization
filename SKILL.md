@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 1.1.0
+version: 1.2.0
 author: Iris
 license: MIT
 trigger: >-
@@ -34,6 +34,17 @@ Each maintenance run is independent. Always re-check current state (capacities, 
 - **L2 — Hindsight** (localhost:8888, bank `main`): semantic recall on demand. Episodes, preferences, decisions.
 - **L3 — LLM Wiki / OKF bundle**: compiled knowledge. SA-Copilot bundle at `~/.hermes/kb` (git-versioned); older static wiki at `/root/wiki/`.
 - **Division of labor:** L1 = "must know this turn" · L2 = "recall when relevant" · L3 = "compiled knowledge with sources". A fact existing in two layers lives in the deepest layer that surfaces it reliably — usually L2.
+
+## L2 ↔ L3 Bridge: Hindsight and the Wiki (research, Aug 2026)
+
+The two systems are complementary, not competing. Hindsight is a **memory engine** (ingest raw turns → auto-extract typed facts + entity graph → consolidate into deduped observations → TEMPR retrieval: semantic + BM25 + graph + temporal, RRF-fused, cross-encoder reranked). The wiki is a **compiled artifact** (knowledge distilled once, kept current, never re-derived). Four integration patterns, in escalating investment:
+
+1. **Pointer retention (cheapest — default).** Retain wiki page references into Hindsight with tags and paths: `retain("Wiki page 'X' at <path> covers A, B, C", tags=["wiki-ref"])`. Recall then surfaces the pointer; the agent opens the page. Hindsight becomes the search layer over the wiki without duplicating content. Do NOT retain page bodies — that breaks L2/L3 separation and doubles consolidation cost.
+2. **Wiki as curated raw layer.** Feed wiki pages into Hindsight via the documents API. Hindsight adds what a static wiki can't: temporal reasoning, multi-hop entity traversal, and automatic contradiction reconciliation (a hand-maintained wiki keeps contradictions "a paragraph apart"; consolidation resolves them). Costly — use only for high-value curated corpora.
+3. **Dual-store role separation (this deployment's shape).** Wiki = compiled, human-reviewable domain knowledge (index-first lookup, deterministic, cheap). Hindsight = operational memory (fuzzy, temporal, multi-hop). Reference the wiki when the question maps to a known page; fall back to recall for temporal/personal/entity questions.
+4. **Knowledge Pages (native, Hindsight ≥ v0.9).** Hindsight projects its own wiki: Knowledge Pages are self-rewriting markdown documents built from consolidated observations only, organized in a folder tree, mounted to disk via `hindsight fs mount --bank <bank>` (real markdown + YAML frontmatter, background refresh loop; export bundle = index.md + one file per page + log.md — structurally parallel to the Karpathy layout). Key property: a page is a **projected view over memory, not storage** — it heals itself because it re-projects; delete it and nothing is lost. Defaults that matter for maintenance: `fact_types: ["observation"]`, `mode: "delta"` (edits, never regenerates), `exclude_mental_models: true` (pages never cite each other — no feedback loops). Tree staleness (`is_stale`) comes from a single bank-wide `last_memory_write_at` signal — cheap but approximate; the page's mental model gives the exact answer.
+
+**Maintenance implication:** in Pattern 4 the wiki layer needs no lint for contradictions/staleness — consolidation does it. But it inherits L2's failure modes: if retains silently fail, pages go stale with no error. Knowledge-page health rides on the same `failed_operations` + smoke-test checks as Step 2. In Patterns 1–3, wiki lint (Step 3) remains necessary and Hindsight pointers must be invalidated when their target page is archived/moved.
 
 ## Research Grounding (web research, Aug 2026)
 Key findings from agent-memory literature that drive this procedure:
@@ -111,3 +122,6 @@ Manual runs of this skill are for deep maintenance: USER.md prunes, L2 dedup/con
 - TianPan: Agent Memory Garbage Collection (Apr 2026) — generational TTL tiers, semantic dedup as mark-and-sweep, contradiction detection, 3× accuracy result.
 - RankSquire: Agent Memory vs RAG at Scale (Mar 2026) — 10K-interaction threshold, memory pollution, hybrid architecture.
 - Zylos Research: Selective Retention and Forgetting (Jun 2026) — CLS theory mapping, importance scoring (recency+importance+relevance), framework survey (Letta/Zep/Mem0/Dreaming V3).
+- Hindsight docs — Knowledge Pages (hindsight.vectorize.io/developer/knowledge-pages) and Knowledge Pages API (…/developer/api/knowledge-pages), Aug 2026: pages as projected views over memory, `hindsight fs mount`, default trigger (observations-only, delta mode, exclude_mental_models), staleness signal.
+- Latimer et al., "Hindsight is 20/20: Building Agent Memory that Retains, Recalls, and Reflects," arXiv:2512.12818 (Dec 2025) — four logical networks, retain/recall/reflect, 91.4% LongMemEval.
+- Karpathy, "LLM Wiki" gist (Apr 2026) — three layers, index-first scaling without embedding RAG, file-back answers.
