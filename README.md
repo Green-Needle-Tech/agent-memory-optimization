@@ -76,6 +76,57 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 
 Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
 
+### Pipeline flowchart
+
+```mermaid
+flowchart TD
+    START([Daily cron triggers<br/>8:00 AM SGT]) --> L2A[L2: POST /consolidate]
+    L2A --> POLL{Operation<br/>completed?}
+    POLL -- no, ≤8 min --> POLL
+    POLL -- timeout / error --> ERR
+    POLL -- completed --> L2B[L2: Recall smoke-test<br/>over-prune check]
+    L2B --> L2C[L2: Retain smoke-test<br/>success AND total_tokens > 0]
+    L2C --> L2D[L2: Bank stats<br/>nodes > 0, failed_ops trend]
+
+    L2D --> KP{Hindsight ≥ 0.9?<br/>/knowledge-base/tree}
+    KP -- "404 / < 0.9" --> L1A
+    KP -- ok --> KP2{KB ≤ 25 pages?}
+    KP2 -- yes --> KP3["Exact per-page check<br/>GET /mental-models/{id}"]
+    KP2 -- no --> KP4[Tree is_stale<br/>bank-wide approximation]
+    KP3 --> KP5{> 50% pages stale?}
+    KP4 --> KP5
+    KP5 -- yes --> WARN[Report issue:<br/>pages falling behind]
+    KP5 -- no --> L1A
+
+    L1A[L1: MEMORY.md / USER.md<br/>capacity check] --> L1B{MEMORY.md<br/>≥ 90%?}
+    L1B -- yes --> OFF[Run memory_offload.py<br/>offload to Hindsight]
+    L1B -- no --> L3A
+    OFF --> L3A
+
+    L3A[L3: Wiki lint-lite<br/>~/.hermes/kb] --> L3B{≥ 5 pages<br/>> 90 days stale?}
+    L3B -- yes --> WARN
+    L3B -- no --> OUT{Any issues<br/>collected?}
+    WARN --> OUT
+
+    OUT -- yes --> MSG([Deliver issue report<br/>to Telegram])
+    OUT -- no --> SILENT([Silent: empty stdout<br/>exit 0])
+    ERR --> OUT
+
+    classDef layer fill:#1f2937,stroke:#6366f1,color:#e5e7eb
+    classDef decision fill:#1f2937,stroke:#f59e0b,color:#e5e7eb
+    classDef warn fill:#1f2937,stroke:#ef4444,color:#fca5a5
+    classDef done fill:#1f2937,stroke:#10b981,color:#a7f3d0
+    class L2A,L2B,L2C,L2D,KP3,KP4,L1A,L3A,OFF layer
+    class POLL,KP,KP2,KP5,L1B,L3B,OUT decision
+    class WARN,ERR warn
+    class START,MSG,SILENT done
+```
+
+**Key invariants**
+- Health green ≠ writes working — the retain smoke-test (`total_tokens > 0`) catches silent LLM-layer failures
+- Exit 0 always; errors surface via stdout, never via nonzero exit
+- The script's own smoke-test retain means a small Knowledge Base always reads stale in the tree — hence the exact per-page mental-model check for KBs ≤ 25 pages
+
 ## Sources
 
 - [The Consolidation Problem in Agent Memory](https://hindsight.vectorize.io/blog/2026/05/21/agent-memory-consolidation) (Hindsight, May 2026)
