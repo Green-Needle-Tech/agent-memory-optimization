@@ -127,6 +127,48 @@ flowchart TD
 - Exit 0 always; errors surface via stdout, never via nonzero exit
 - The script's own smoke-test retain means a small Knowledge Base always reads stale in the tree — hence the exact per-page mental-model check for KBs ≤ 25 pages
 
+### Sample report (agent-driven run)
+
+The no-agent cron is silent on success, but the same pipeline can also run agent-driven with a full report. Example output from a real run (Aug 24, 2026):
+
+```text
+🧠 Daily Memory Optimization Report
+Run: 2026-08-24 (Mon, SGT) | Bank: hermes
+
+Step 0 — Assessment
+• L1 MEMORY.md: 85% (1,881/2,200) — ⚠️ over 75% threshold
+• L1 USER.md: 50% (700/1,375) — ✅ healthy
+• L2 Hindsight: 1,641 nodes, 351 failed ops — ⚠️ investigated
+• L3 Wiki: 204K, 31 .md files (28 content) — ✅ clean
+
+Step 1 — L1 Prune + Densify
+• 2 entries densified in one atomic batch (270→220 chars; L3 entry
+  reduced to path + skill reference — detail already in Hindsight)
+• MEMORY.md: 85% → 73% (−264 chars, −12%); USER.md unchanged
+• Remaining 9 entries all durable, high-signal conventions — no offload
+
+Step 2 — L2 Hindsight Maintenance
+• 351 failed ops: all 402 Insufficient credits from pre-key-rotation
+  window — no active failures ✅
+• 179 failed consolidations: same 402 window; POST /consolidate →
+  deduplicated: false (nothing pending) ✅
+• Post-consolidation recall-verify: PASS
+• Semantic dedup skipped (store cleaned Aug 12); no contradictions;
+  config already optimal
+
+Step 3 — L3 Wiki Lint
+• Orphans: 0 · Broken [[links]]: 0 · Frontmatter: 28/28 valid
+• Index: 28/28 · Staleness >90d: 0 · log.md: 39 entries
+• 1 flag: reference/data-analytics.md at 447 lines exceeds the
+  200-line guideline — held for user approval (6+ inbound links)
+
+Step 4 — Verdict: 🟢 STABLE
+No active contradictions, no pollution signals, recall precision
+intact across all three layers.
+```
+
+Key takeaway: the 402 error burst looked alarming in raw failed-op counts but was a resolved transient (expired credits) — the investigation step prevents false alarms, and the report ends with exactly one actionable item requiring human sign-off rather than auto-splitting a heavily linked wiki page.
+
 ## Sources
 
 - [The Consolidation Problem in Agent Memory](https://hindsight.vectorize.io/blog/2026/05/21/agent-memory-consolidation) (Hindsight, May 2026)
