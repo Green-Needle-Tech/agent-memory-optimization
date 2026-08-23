@@ -70,7 +70,7 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 2. Recall smoke-test (consolidation over-prune check)
 3. Retain smoke-test — `total_tokens > 0` proves fact extraction ran (health green ≠ writes working)
 4. Bank stats: node count + failed_operations trend vs last run
-5. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; skipped silently on older versions)
+5. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
 6. L1 capacity check (≥90% warns / triggers Hindsight offload)
 7. L3 wiki lint-lite (≥5 pages >90 days stale warns)
 

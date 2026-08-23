@@ -43,6 +43,7 @@ KB_DIR = Path("/root/.hermes/kb")
 KB_STALE_DAYS = 90           # L3 page staleness threshold (skill: >90 days = stale)
 FAILED_OPS_WARN = 10         # failed_operations count worth reporting
 KP_STALE_RATIO_WARN = 0.5    # warn when >50% of knowledge pages are stale
+KP_EXACT_CHECK_MAX = 25      # use exact per-page mental-model is_stale for KBs up to this size
 STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_state.json")
 
 
@@ -147,14 +148,30 @@ def main():
 
     # --- 4b. Knowledge Pages health (Hindsight >= 0.9 only) -------------
     # A page is a projected view over memory — it inherits L2's failure
-    # modes. is_stale comes from a single bank-wide last_memory_write_at
-    # signal (approximate); a high stale ratio means pages are falling
-    # behind consolidation. 404 = older version or feature off: skip.
+    # modes. The tree's is_stale comes from a single bank-wide
+    # last_memory_write_at signal, so on a bank that receives daily writes
+    # (incl. this script's own smoke-test retain) EVERY page looks stale —
+    # a false positive. For small KBs (<= KP_EXACT_CHECK_MAX pages) query
+    # each page's mental model for the exact per-page is_stale instead.
+    # 404 = older version or feature off: skip.
     try:
         status, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=15)
         pages = [n for n in walk_tree(tree.get("roots")) if n.get("kind") == "page"]
         if pages:
-            stale = [n for n in pages if n.get("is_stale")]
+            if len(pages) <= KP_EXACT_CHECK_MAX:
+                stale = []
+                for n in pages:
+                    mm = n.get("mental_model_id")
+                    if not mm:
+                        continue
+                    try:
+                        _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=15)
+                        if m.get("is_stale"):
+                            stale.append(n)
+                    except Exception:
+                        pass  # per-page failure shouldn't kill the check
+            else:
+                stale = [n for n in pages if n.get("is_stale")]
             if stale and len(stale) / len(pages) > KP_STALE_RATIO_WARN:
                 problems.append(
                     f"Knowledge Pages: {len(stale)}/{len(pages)} pages stale "

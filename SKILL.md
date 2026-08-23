@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 1.3.0
+version: 1.3.1
 author: Iris
 license: MIT
 trigger: >-
@@ -112,7 +112,7 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 2. Recall smoke-test after consolidation (over-prune check)
 3. **Retain smoke-test**: `success:true` AND `total_tokens > 0` — the exact step that silently fails while health stays green
 4. Bank stats: `total_nodes > 0`, `failed_operations` trend vs last run (state file)
-5. **Knowledge Pages tree** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages report `is_stale` — pages are projected views that inherit L2's failure modes; 404 on older versions = skip silently
+5. **Knowledge Pages health** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages are stale — pages are projected views that inherit L2's failure modes. ⚠️ The tree's `is_stale` is a single bank-wide `last_memory_write_at` signal — on a bank that receives daily writes (including this script's own smoke-test retain) every page reads stale (false positive). For KBs ≤25 pages the script queries each page's mental model (`GET /mental-models/{id}`) for the exact per-page `is_stale`. 404 on older versions = skip silently
 6. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload
 7. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
 
