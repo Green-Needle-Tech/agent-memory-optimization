@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 1.2.0
+version: 1.3.0
 author: Iris
 license: MIT
 trigger: >-
@@ -104,13 +104,31 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 
 ## Automation context (already in place — do not duplicate)
 - Auto-offload cron (every 30min, `memory_offload.py`): handles L1 >75% automatically.
-- Daily memory optimization cron at 8:00 AM SGT (no-agent Python).
+- Daily memory optimization cron at 8:00 AM SGT (no-agent Python, `scripts/daily_memory_optimization.py` in this repo — deploy a copy to `~/.hermes/scripts/` next to `memory_offload.py`).
 - Hindsight health watchdog every 15min.
+
+### Daily cron behavior (v1.3.0, targets Hindsight 0.8+; KP checks activate on 0.9+)
+1. `POST /consolidate` → poll operation to terminal state (max 8 min)
+2. Recall smoke-test after consolidation (over-prune check)
+3. **Retain smoke-test**: `success:true` AND `total_tokens > 0` — the exact step that silently fails while health stays green
+4. Bank stats: `total_nodes > 0`, `failed_operations` trend vs last run (state file)
+5. **Knowledge Pages tree** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages report `is_stale` — pages are projected views that inherit L2's failure modes; 404 on older versions = skip silently
+6. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload
+7. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
+
+Silent on success (empty stdout); exit 0 always — errors surface via stdout, never via nonzero exit.
+
+## Field research addendum (Aug 2026)
+The 2026 Q1 memory-landscape shift: three of four new systems (Supermemory ASMR, Mastra Observational Memory, Hindsight) abandon plain vector-DB retrieval in favor of **compress-and-reason**. Two consequences for this procedure:
+- **Compression is a first-class memory strategy**, not an emergency measure (Observational Memory: 5–40× compression, 94.87% LongMemEval with a single small model). L1 densification and L2 consolidation are the same lever — treat them as the primary optimization, not housekeeping.
+- **LLM-as-retriever** (Hindsight's Cara reflect agent, ASMR's search agents) raises retrieval quality but makes every retrieval depend on LLM availability — which is why the daily retain smoke-test (`total_tokens > 0`) matters: LLM-layer failure is the dominant silent failure mode in this architecture.
+
 Manual runs of this skill are for deep maintenance: USER.md prunes, L2 dedup/contradiction passes, L3 lints.
 
 ## Pitfalls
 - memory batch ops are atomic — one bad `old_text` rejects everything; copy exact text from `current_entries`.
 - Health green ≠ writes working; always check failed_operations + smoke-test retain (`total_tokens > 0`).
+- Knowledge Pages tree endpoint is `/knowledge-base/tree` (not `/knowledge-base`, which 404s); page bodies need a separate `GET /knowledge-base/pages/{id}` fetch.
 - `§` separators are display-only; never include in `old_text`.
 - Consolidation over-pruning: always recall-verify after `POST /consolidate`.
 - Don't create L3 pages for passing mentions (2+ source rule) — the #1 wiki bloat source.
@@ -125,3 +143,4 @@ Manual runs of this skill are for deep maintenance: USER.md prunes, L2 dedup/con
 - Hindsight docs — Knowledge Pages (hindsight.vectorize.io/developer/knowledge-pages) and Knowledge Pages API (…/developer/api/knowledge-pages), Aug 2026: pages as projected views over memory, `hindsight fs mount`, default trigger (observations-only, delta mode, exclude_mental_models), staleness signal.
 - Latimer et al., "Hindsight is 20/20: Building Agent Memory that Retains, Recalls, and Reflects," arXiv:2512.12818 (Dec 2025) — four logical networks, retain/recall/reflect, 91.4% LongMemEval.
 - Karpathy, "LLM Wiki" gist (Apr 2026) — three layers, index-first scaling without embedding RAG, file-back answers.
+- LLM Memory Research, "LLM Memory Systems: 2026 Q1 Update" (lin-guanguo.github.io, Mar 2026) — anti-RAG shift: Supermemory ASMR (LLM-as-retriever, ensemble voting), Mastra Observational Memory (pure compression, 94.87% LongMemEval), Hindsight (TEMPR 4-way retrieval + MPFP traversal + Cara reflect), MemOS.

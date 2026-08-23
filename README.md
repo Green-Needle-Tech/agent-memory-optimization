@@ -62,6 +62,20 @@ Hindsight and the LLM Wiki are complementary: Hindsight is a memory engine (auto
 
 Full detail in [SKILL.md](SKILL.md) § "L2 ↔ L3 Bridge".
 
+## Daily cron automation
+
+The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`, targets Hindsight 0.8+ — Knowledge Pages checks activate automatically on 0.9+):
+
+1. Trigger L2 consolidation and poll it to completion (max 8 min)
+2. Recall smoke-test (consolidation over-prune check)
+3. Retain smoke-test — `total_tokens > 0` proves fact extraction ran (health green ≠ writes working)
+4. Bank stats: node count + failed_operations trend vs last run
+5. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; skipped silently on older versions)
+6. L1 capacity check (≥90% warns / triggers Hindsight offload)
+7. L3 wiki lint-lite (≥5 pages >90 days stale warns)
+
+Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
+
 ## Sources
 
 - [The Consolidation Problem in Agent Memory](https://hindsight.vectorize.io/blog/2026/05/21/agent-memory-consolidation) (Hindsight, May 2026)
