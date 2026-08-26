@@ -66,7 +66,7 @@ DEDUP_RECALL_LIMIT = 50      # max memories to recall for LLM dedup/contradictio
 DEDUP_RECALL_TOKENS = 3000   # token budget for recall query
 
 
-def http(method, path, timeout=15, body=None):
+def http(method, path, timeout=120, body=None):
     req = urllib.request.Request(
         BASE + path,
         method=method,
@@ -91,7 +91,7 @@ def recall_recent_memories(query="user preferences, environment, configuration, 
     Returns list of {id, content} dicts, or empty list on failure.
     """
     try:
-        _, resp = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=30,
+        _, resp = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=120,
                        body={"query": query, "max_tokens": DEDUP_RECALL_TOKENS})
         hits = resp.get("results") or resp.get("memories") or resp.get("items") or []
         memories = []
@@ -111,7 +111,7 @@ def invalidate_memory(mid, reason="duplicate"):
     Never DELETE — invalidation preserves audit trail and is recoverable.
     """
     try:
-        http("PATCH", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=15,
+        http("PATCH", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=120,
              body={"state": "invalidated", "reason": reason})
         return True
     except Exception:
@@ -216,7 +216,7 @@ def main():
     # --- 1. Trigger consolidation -------------------------------------
     op_id = None
     try:
-        status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=30, body={})
+        status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
         op_id = resp.get("operation_id")
         if not op_id:
             problems.append(f"Consolidate returned HTTP {status} but no operation_id: {str(resp)[:120]}")
@@ -229,7 +229,7 @@ def main():
         deadline = time.time() + POLL_DEADLINE
         while time.time() < deadline:
             try:
-                _, op = http("GET", f"/v1/default/banks/{BANK}/operations/{op_id}", timeout=15)
+                _, op = http("GET", f"/v1/default/banks/{BANK}/operations/{op_id}", timeout=120)
                 st = op.get("status", "")
                 if st in ("completed", "failed", "error", "cancelled"):
                     final = op
@@ -247,7 +247,7 @@ def main():
     # Health green != writes/recall working; probe a known-durable fact.
     if final is not None and final.get("status") == "completed":
         try:
-            _, rec = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=30,
+            _, rec = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=120,
                           body={"query": "David's preferred output language and document summary style"})
             hits = rec.get("results") or rec.get("memories") or rec.get("items") or []
             if not hits:
@@ -259,7 +259,7 @@ def main():
     # success:true with total_tokens == 0 means fact extraction did NOT run
     # (the exact step that fails on broken auth / bad LLM while health is green).
     try:
-        _, ret = http("POST", f"/v1/default/banks/{BANK}/memories", timeout=60,
+        _, ret = http("POST", f"/v1/default/banks/{BANK}/memories", timeout=120,
                       body={"items": [{"content": f"daily memory optimization smoke test {time.strftime('%Y-%m-%d')}"}]})
         usage = (ret.get("usage") or {})
         if not ret.get("success"):
@@ -271,7 +271,7 @@ def main():
 
     # --- 4. Bank stats + failed_operations trend -----------------------
     try:
-        _, stats = http("GET", f"/v1/default/banks/{BANK}/stats", timeout=15)
+        _, stats = http("GET", f"/v1/default/banks/{BANK}/stats", timeout=120)
         nodes = stats.get("total_nodes", 0)
         docs = stats.get("total_documents", 0)
         if nodes <= 0:
@@ -315,7 +315,7 @@ def main():
     # each page's mental model for the exact per-page is_stale instead.
     # 404 = older version or feature off: skip.
     try:
-        status, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=15)
+        status, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=120)
         pages = [n for n in walk_tree(tree.get("roots")) if n.get("kind") == "page"]
         if pages:
             if len(pages) <= KP_EXACT_CHECK_MAX:
@@ -325,7 +325,7 @@ def main():
                     if not mm:
                         continue
                     try:
-                        _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=15)
+                        _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=120)
                         if m.get("is_stale"):
                             stale.append(n)
                     except Exception:

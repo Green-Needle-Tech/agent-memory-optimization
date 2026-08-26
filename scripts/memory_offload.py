@@ -112,7 +112,7 @@ def hindsight_health_check():
     """Check if Hindsight is healthy before offloading."""
     try:
         req = urllib.request.Request(f"{HINDSIGHT_URL}/health")
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
             return data.get("status") == "healthy"
     except Exception:
@@ -133,7 +133,7 @@ def hindsight_recall_check(content):
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
             results = data.get("results", [])
             if not results:
@@ -169,7 +169,7 @@ def hindsight_retain(content, tags):
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read())
         success = data.get("success", False)
         tokens = data.get("usage", {}).get("total_tokens", 0)
