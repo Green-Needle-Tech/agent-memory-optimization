@@ -3,19 +3,28 @@
 
 no-agent cron script: stdout is delivered verbatim; empty stdout = silent.
 
-Behavior (per memory-optimization skill v1.3.0):
+v2.0 (Aug 2026): LLM-driven semantic dedup + contradiction detection.
+  - L2 semantic dedup pass via llm_judge.semantic_dedup() (replaces manual recall+overlap)
+  - L2 contradiction scan via llm_judge.detect_contradictions() (replaces manual scan)
+  - LLM-optional: degrades to rule-based if LLM unavailable
+  - Batch consolidation: all memories in one LLM call (LycheeMemory V2 pattern)
+
+Behavior (per memory-optimization skill v2.0.0):
   L2 (Hindsight, any 0.8+; Knowledge Pages checks activate on 0.9+):
     1. POST /consolidate -> poll operation to terminal state (max 8 min)
     2. Recall smoke-test after consolidation (over-prune check)
     3. Retain smoke-test: success:true AND total_tokens>0
        (health green != writes working — fact extraction is what silently fails)
     4. Bank stats: total_nodes>0, failed_operations trend vs last run
-    5. Knowledge Pages tree: count pages + is_stale pages (0.9+ only;
-       skipped silently on older versions / empty knowledge base)
+    5. **NEW** LLM semantic dedup pass: recall recent memories, LLM identifies
+       near-duplicates, invalidate via PATCH (non-destructive: state=invalidated)
+    6. **NEW** LLM contradiction scan: recall recent memories, LLM finds entity-drift
+       pairs, apply recency-wins invalidation (state changes) or flag for human review
+    7. Knowledge Pages tree: count pages + is_stale pages (0.9+ only)
   L1 (local memory):
-    6. MEMORY.md / USER.md capacity check; >=90% triggers Hindsight offload
+    8. MEMORY.md / USER.md capacity check; >=90% triggers Hindsight offload
   L3 (LLM wiki / OKF bundle):
-    7. Wiki lint-lite: stale-page count (>90 days) on ~/.hermes/kb
+    9. Wiki lint-lite: stale-page count (>90 days) on ~/.hermes/kb
 
 Output only when something needs attention; else silent. Exit 0 always
 (a crash is reported via stdout, never via nonzero exit).
@@ -23,9 +32,15 @@ Output only when something needs attention; else silent. Exit 0 always
 import json, sys, time, urllib.request, urllib.error
 from pathlib import Path
 
+# LLM judge module (LLM-optional — degrades to rule-based if unavailable)
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    import llm_judge  # noqa: E402
+except ImportError:
+    llm_judge = None  # standalone run: skip LLM-driven steps
+
 # Reuse the proven offload routine from the 30-min offload cron
 # (deployed copy lives next to this file in ~/.hermes/scripts/).
-sys.path.insert(0, str(Path(__file__).parent))
 try:
     import memory_offload  # noqa: E402
 except ImportError:
@@ -46,6 +61,10 @@ KP_STALE_RATIO_WARN = 0.5    # warn when >50% of knowledge pages are stale
 KP_EXACT_CHECK_MAX = 25      # use exact per-page mental-model is_stale for KBs up to this size
 STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_state.json")
 
+# LLM-driven dedup/contradiction settings
+DEDUP_RECALL_LIMIT = 50      # max memories to recall for LLM dedup/contradiction scan
+DEDUP_RECALL_TOKENS = 3000   # token budget for recall query
+
 
 def http(method, path, timeout=15, body=None):
     req = urllib.request.Request(
@@ -64,6 +83,131 @@ def walk_tree(nodes):
     for n in nodes or []:
         yield n
         yield from walk_tree(n.get("children"))
+
+
+def recall_recent_memories(query="user preferences, environment, configuration, tools"):
+    """Recall recent memories for LLM-driven dedup + contradiction scan.
+
+    Returns list of {id, content} dicts, or empty list on failure.
+    """
+    try:
+        _, resp = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=30,
+                       body={"query": query, "max_tokens": DEDUP_RECALL_TOKENS})
+        hits = resp.get("results") or resp.get("memories") or resp.get("items") or []
+        memories = []
+        for h in hits:
+            mid = h.get("id") or h.get("memory_id")
+            content = h.get("content", "") or h.get("text", "")
+            if mid and content:
+                memories.append({"id": mid, "content": content})
+        return memories[:DEDUP_RECALL_LIMIT]
+    except Exception:
+        return []
+
+
+def invalidate_memory(mid, reason="duplicate"):
+    """Non-destructive invalidation: PATCH state=invalidated (recall-hidden, retained on disk).
+
+    Never DELETE — invalidation preserves audit trail and is recoverable.
+    """
+    try:
+        http("PATCH", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=15,
+             body={"state": "invalidated", "reason": reason})
+        return True
+    except Exception:
+        return False
+
+
+def llm_semantic_dedup_pass(problems):
+    """LLM-driven semantic dedup pass (Step 5, new in v2.0).
+
+    Recalls recent memories, uses LLM to identify semantic near-duplicates
+    (same fact, different wording), and invalidates the duplicates via PATCH
+    (non-destructive: state=invalidated, retained on disk for audit).
+
+    Research basis:
+    - MenteDB llm_consolidation: LLM-as-judge for semantic dedup
+    - Hindsight blog: fact deduplication — "same claim, different wording"
+    - Human-Inspired Memory: dedup-based consolidation achieves 97.2% precision, 58% store reduction
+    """
+    if llm_judge is None:
+        return  # LLM unavailable — skip (rule-based dedup happens in Hindsight's own consolidation)
+
+    memories = recall_recent_memories()
+    if len(memories) < 2:
+        return  # nothing to dedup
+
+    contents = [m["content"] for m in memories]
+    dup_groups = llm_judge.semantic_dedup(contents)
+
+    invalidated = 0
+    for group in dup_groups:
+        canonical_idx = group["canonical"]
+        for dup_idx in group["duplicates"]:
+            if dup_idx < len(memories):
+                mid = memories[dup_idx]["id"]
+                if invalidate_memory(mid, reason="semantic_duplicate"):
+                    invalidated += 1
+
+    if invalidated > 0:
+        problems.append(
+            f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
+            f"(non-destructive — retained on disk for audit)"
+        )
+
+
+def llm_contradiction_scan(problems):
+    """LLM-driven contradiction detection (Step 6, new in v2.0).
+
+    Recalls recent memories, uses LLM to find entity-drift pairs (old vs new
+    state of the same fact), and applies recency-wins invalidation for state
+    changes. Stable-attribute conflicts are flagged for human review.
+
+    Research basis:
+    - Hindsight blog: conflict handling — recency wins for state, source/confidence for stable
+    - Hindsight blog: entity drift (Postgres→MySQL) is the canonical failure
+    """
+    if llm_judge is None:
+        return  # LLM unavailable — skip
+
+    memories = recall_recent_memories(
+        query="provider, model, url, port, version, configuration changes, migrations"
+    )
+    if len(memories) < 2:
+        return  # nothing to scan
+
+    contents = [m["content"] for m in memories]
+    contradictions = llm_judge.detect_contradictions(contents)
+
+    invalidated = 0
+    flagged = 0
+    for c in contradictions:
+        pair = c["pair"]
+        resolution = c.get("resolution", "flag_human")
+        reason = c.get("reason", "")
+        newer_idx = c.get("newer_index")
+
+        if resolution == "recency_wins" and newer_idx is not None:
+            # Invalidate the OLDER entry (the one that's NOT newer_idx)
+            older_idx = pair[0] if pair[1] == newer_idx else pair[1]
+            if older_idx < len(memories):
+                mid = memories[older_idx]["id"]
+                if invalidate_memory(mid, reason=f"superseded: {reason}"):
+                    invalidated += 1
+        else:
+            # Stable conflict — flag for human review (don't auto-resolve)
+            flagged += 1
+            pair_contents = [contents[pair[0]][:60], contents[pair[1]][:60]]
+            problems.append(
+                f"LLM contradiction scan: stable-attribute conflict needs review — "
+                f"[{pair_contents[0]}] vs [{pair_contents[1]}] ({reason})"
+            )
+
+    if invalidated > 0:
+        problems.append(
+            f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
+            f"(recency-wins, non-destructive)"
+        )
 
 
 def main():
@@ -125,7 +269,7 @@ def main():
     except Exception as e:
         problems.append(f"Retain smoke-test failed: {type(e).__name__}: {e}")
 
-    # --- 4. Bank stats + failed_operations trend ------------------------
+    # --- 4. Bank stats + failed_operations trend -----------------------
     try:
         _, stats = http("GET", f"/v1/default/banks/{BANK}/stats", timeout=15)
         nodes = stats.get("total_nodes", 0)
@@ -146,7 +290,23 @@ def main():
     except Exception as e:
         problems.append(f"Bank stats fetch failed: {type(e).__name__}: {e}")
 
-    # --- 4b. Knowledge Pages health (Hindsight >= 0.9 only) -------------
+    # --- 5. LLM semantic dedup pass (NEW in v2.0) ----------------------
+    # Recall recent memories, LLM identifies near-duplicates, invalidate
+    # (non-destructive). Research: 30-40% reduction on polluted stores.
+    try:
+        llm_semantic_dedup_pass(problems)
+    except Exception as e:
+        problems.append(f"LLM semantic dedup pass failed: {type(e).__name__}: {e}")
+
+    # --- 6. LLM contradiction scan (NEW in v2.0) -----------------------
+    # Recall recent memories, LLM finds entity-drift pairs, apply
+    # recency-wins invalidation or flag for human review.
+    try:
+        llm_contradiction_scan(problems)
+    except Exception as e:
+        problems.append(f"LLM contradiction scan failed: {type(e).__name__}: {e}")
+
+    # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) -------------
     # A page is a projected view over memory — it inherits L2's failure
     # modes. The tree's is_stale comes from a single bank-wide
     # last_memory_write_at signal, so on a bank that receives daily writes
@@ -182,7 +342,7 @@ def main():
     except Exception as e:
         problems.append(f"Knowledge Pages check failed: {type(e).__name__}: {e}")
 
-    # --- 4c. L3 wiki lint-lite ------------------------------------------
+    # --- 7b. L3 wiki lint-lite ------------------------------------------
     try:
         if KB_DIR.exists():
             md_files = [p for p in KB_DIR.rglob("*.md") if "_archive" not in p.parts]
@@ -202,7 +362,7 @@ def main():
     except Exception as e:
         problems.append(f"L3 wiki check failed: {type(e).__name__}: {e}")
 
-    # --- 5. Local memory capacity check --------------------------------
+    # --- 8. Local memory capacity check --------------------------------
     try:
         mem = Path("/root/.hermes/memories/MEMORY.md")
         usr = Path("/root/.hermes/memories/USER.md")
@@ -246,9 +406,9 @@ def main():
     except Exception as e:
         problems.append(f"Local memory check failed: {type(e).__name__}: {e}")
 
-    # --- 6. Output ------------------------------------------------------
+    # --- 9. Output ------------------------------------------------------
     if problems:
-        print("**🧠 Daily Memory Optimization — issues found**\n")
+        print(f"**🧠 Daily Memory Optimization — issues found**\n")
         for p in problems:
             print(f"  • {p}")
     # else: empty stdout -> cron stays silent

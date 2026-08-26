@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 1.3.1
+version: 2.0.0
 author: Iris
 license: MIT
 trigger: >-
@@ -58,6 +58,28 @@ Key findings from agent-memory literature that drive this procedure:
 7. **Contradiction handling**: for state changes, recency wins (supersede, don't delete); for stable attributes, prefer source/confidence. Always resolve at write time, not query time.
 8. **Eviction is for compliance only** (GDPR, PII, user request). For performance problems, fix importance/merge/decay upstream instead — Hindsight's design premise: good consolidation makes eviction unnecessary.
 
+## LLM-as-Judge (v2.0, Aug 2026)
+
+The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** for three operations, grounded in 2026 agent-memory research:
+
+1. **Importance classification** (`llm_judge.classify_importance`) — replaces hardcoded prefix matching with LLM-rated long-term retention value (Park et al. Generative Agents importance scoring + Hindsight fact-extraction-as-filter). All entries classified in a single batched LLM call (LycheeMemory V2 segment-level batching pattern — 75-87% fewer LLM calls vs per-entry).
+
+2. **Semantic dedup** (`llm_judge.semantic_dedup`) — replaces word-overlap >60% with LLM judge that identifies near-duplicates expressing the same fact with different wording ("User prefers Python" vs "User's primary language is Python"). Research: semantic dedup shrinks polluted stores 30-40% with no information loss (TianPan GC article); dedup-based consolidation achieves 97.2% retention precision with 58% store reduction (Human-Inspired Memory, arXiv:2605.08538).
+
+3. **Contradiction detection** (`llm_judge.detect_contradictions`) — replaces manual scan with LLM-driven entity-drift detection. Resolution policy: recency-wins for state changes (invalidate old, keep new); flag-for-human for stable attributes (Hindsight blog, May 2026).
+
+**LLM-optional design** (MenteDB `llm_consolidation` pattern): all three operations degrade to rule-based fallbacks if the LLM endpoint is unavailable. Callers with no LLM simply get the old heuristic behavior — the engine stays functional. The `llm_judge` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `google/gemini-2.5-flash` by default (~$0.0001/call).
+
+**Non-destructive invalidation**: dedup and contradiction resolution use `PATCH /memories/{id} {"state":"invalidated"}` (recall-hidden, retained on disk for audit). Never `DELETE` — old state is recoverable.
+
+### New research sources (v2.0)
+- MenteDB `llm_consolidation` (docs.rs/mentedb) — LLM-as-judge for semantic dedup, LLM-optional design, non-destructive invalidation via `Derived` edges.
+- LycheeMemory V2 (arXiv:2608.12990) — semantic segment-level consolidation, 86% fewer construction tokens vs A-Mem.
+- RecMem (ACL 2026 Findings) — recurrence-based consolidation, 87% token reduction, LLM invoked only on sustained recurrence.
+- Human-Inspired Memory Architecture (arXiv:2605.08538) — dedup-based consolidation: 97.2% precision, 58% store reduction, +21.8pp over baseline.
+- SCM: Sleep-Consolidated Memory (arXiv:2604.20943) — structured forgetting for LLM memory, privacy-aware pruning.
+- NirDiamant/Agent_Memory_Techniques — 30 runnable notebooks: consolidation, compaction, self-reflection, forgetting & decay.
+
 ## Procedure
 
 ### Step 0 — Assess current state
@@ -69,20 +91,20 @@ du -sh ~/.hermes/kb /root/wiki 2>/dev/null
 Report: L1 % for both stores, L2 node count + failed ops, L3 size.
 Red flags: node count climbing fast with flat recall quality (index pollution); failed_operations rising (silent write failures).
 
-### Step 1 — L1 prune + offload
+### Step 1 — L1 prune + offload (LLM-driven, v2.0)
 L1 is the always-injected tier: every char costs attention on every turn. This is write-time importance filtering in its purest form.
-1. Classify entries: essential (host specs, active provider, tool quirks) vs offloadable (stale-in-7-days facts, cron IDs, version numbers, one-time lessons).
-2. Dedup-check each offloadable entry against Hindsight (`hindsight_recall`, skip if >60% word overlap).
+1. Classify entries using `llm_judge.classify_importance(entries)` — LLM rates each entry's long-term retention value in a single batched call. Falls back to prefix matching if LLM unavailable.
+2. Dedup-check each offloadable entry against Hindsight (`hindsight_recall` + `llm_judge.semantic_dedup` for semantic match, skip if LLM says duplicate).
 3. Retain to L2 with context + tags: `hindsight_retain(content=..., context="memory offload", tags=[...])`.
 4. Batch-remove from local via `memory` tool `operations` array — see hermes-local-memory skill for the all-or-nothing pitfall (copy exact `current_entries` text; watch em-dashes).
 5. Densify remaining entries: merge overlapping ones into single compact entries (single atomic batch).
 - **Do NOT retain volatile state** (container states, ports, cron job IDs, current model) — it becomes stale recall bait. Only durable preferences, decisions, and conventions.
 - USER.md at 90%+ needs a manual prune batch — adds fail when near-full, so plan remove+add in ONE batch.
 
-### Step 2 — L2 Hindsight maintenance
+### Step 2 — L2 Hindsight maintenance (LLM-driven, v2.0)
 1. Check `GET /stats`: `failed_operations` must not be climbing (health endpoint alone is NOT proof — writes fail silently while green).
-2. **Semantic dedup pass** (mark-and-sweep): recall-based scan for near-duplicate facts (same claim, different wording — hash/exact dedup misses these). Invalidate duplicate `world`/`experience` memories via `PATCH /memories/{id}` `{"state":"invalidated","reason":"duplicate"}`. Never PATCH `observation` type (derived — 400; invalidate the source instead). Expect 30–40% reduction on a polluted store.
-3. **Contradiction scan**: look for entity-drift pairs (old vs new state of the same fact, e.g. old provider/model/URL). State changes → invalidate the OLD fact (recency wins). Stable attributes that conflict → flag for David rather than auto-resolving.
+2. **LLM semantic dedup pass** (`llm_judge.semantic_dedup`): recall recent memories (max 50), LLM identifies near-duplicate groups (same fact, different wording). Invalidate duplicates via `PATCH /memories/{id} {"state":"invalidated","reason":"semantic_duplicate"}` (non-destructive — recall-hidden, retained on disk). Never PATCH `observation` type (derived — 400; invalidate the source instead). Expect 30-40% reduction on a polluted store.
+3. **LLM contradiction scan** (`llm_judge.detect_contradictions`): recall recent memories, LLM finds entity-drift pairs. State changes → invalidate the OLDER fact (recency wins). Stable attributes that conflict → flag for David rather than auto-resolving.
 4. After invalidations: `POST /consolidate`, then **verify recall** — consolidation can over-prune linked facts; re-add lost critical facts in a single grouped retain.
 5. Config tune (PATCH `/config` with `{"updates":{...}}` wrapper): `recall_budget_function: adaptive`, `recall_max_tokens: 3000`, `consolidation_max_memories_per_round: 50`, bank-specific `retain_mission`/`reflect_mission`.
 6. Set `recall_types: "observation,world,experience"` in the profile's `hindsight/config.json` (NOT via API PATCH — invalid field).
@@ -107,14 +129,16 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 - Daily memory optimization cron at 8:00 AM SGT (no-agent Python, `scripts/daily_memory_optimization.py` in this repo — deploy a copy to `~/.hermes/scripts/` next to `memory_offload.py`).
 - Hindsight health watchdog every 15min.
 
-### Daily cron behavior (v1.3.0, targets Hindsight 0.8+; KP checks activate on 0.9+)
+### Daily cron behavior (v2.0.0, targets Hindsight 0.8+; LLM-driven dedup/contradiction; KP checks on 0.9+)
 1. `POST /consolidate` → poll operation to terminal state (max 8 min)
 2. Recall smoke-test after consolidation (over-prune check)
 3. **Retain smoke-test**: `success:true` AND `total_tokens > 0` — the exact step that silently fails while health stays green
 4. Bank stats: `total_nodes > 0`, `failed_operations` trend vs last run (state file)
-5. **Knowledge Pages health** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages are stale — pages are projected views that inherit L2's failure modes. ⚠️ The tree's `is_stale` is a single bank-wide `last_memory_write_at` signal — on a bank that receives daily writes (including this script's own smoke-test retain) every page reads stale (false positive). For KBs ≤25 pages the script queries each page's mental model (`GET /mental-models/{id}`) for the exact per-page `is_stale`. 404 on older versions = skip silently
-6. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload
-7. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
+5. **LLM semantic dedup pass** (NEW v2.0): recall recent memories (max 50), `llm_judge.semantic_dedup()` identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
+6. **LLM contradiction scan** (NEW v2.0): recall recent memories, `llm_judge.detect_contradictions()` finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts. LLM-optional.
+7. **Knowledge Pages health** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages are stale — pages are projected views that inherit L2's failure modes. ⚠️ The tree's `is_stale` is a single bank-wide `last_memory_write_at` signal — on a bank that receives daily writes (including this script's own smoke-test retain) every page reads stale (false positive). For KBs ≤25 pages the script queries each page's mental model (`GET /mental-models/{id}`) for the exact per-page `is_stale`. 404 on older versions = skip silently
+8. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload (LLM-driven classification)
+9. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
 
 Silent on success (empty stdout); exit 0 always — errors surface via stdout, never via nonzero exit.
 
@@ -144,3 +168,10 @@ Manual runs of this skill are for deep maintenance: USER.md prunes, L2 dedup/con
 - Latimer et al., "Hindsight is 20/20: Building Agent Memory that Retains, Recalls, and Reflects," arXiv:2512.12818 (Dec 2025) — four logical networks, retain/recall/reflect, 91.4% LongMemEval.
 - Karpathy, "LLM Wiki" gist (Apr 2026) — three layers, index-first scaling without embedding RAG, file-back answers.
 - LLM Memory Research, "LLM Memory Systems: 2026 Q1 Update" (lin-guanguo.github.io, Mar 2026) — anti-RAG shift: Supermemory ASMR (LLM-as-retriever, ensemble voting), Mastra Observational Memory (pure compression, 94.87% LongMemEval), Hindsight (TEMPR 4-way retrieval + MPFP traversal + Cara reflect), MemOS.
+- MenteDB `llm_consolidation` (docs.rs/mentedb) — LLM-as-judge for semantic dedup, LLM-optional design, non-destructive invalidation via `Derived` edges.
+- LycheeMemory V2 (arXiv:2608.12990) — semantic segment-level consolidation, 86% fewer construction tokens vs A-Mem.
+- RecMem (ACL 2026 Findings, aclanthology.org/2026.findings-acl.1619) — recurrence-based consolidation, 87% token reduction, LLM invoked only on sustained recurrence.
+- Human-Inspired Memory Architecture (arXiv:2605.08538) — dedup-based consolidation: 97.2% precision, 58% store reduction, +21.8pp over baseline.
+- SCM: Sleep-Consolidated Memory (arXiv:2604.20943) — structured forgetting for LLM memory, privacy-aware pruning.
+- NirDiamant/Agent_Memory_Techniques (github.com/NirDiamant/Agent_Memory_Techniques) — 30 runnable notebooks: consolidation, compaction, self-reflection, forgetting & decay.
+- MEM1 (arXiv:2506.15841) — end-to-end RL for memory consolidation via context pruning, ReAct framework extension.

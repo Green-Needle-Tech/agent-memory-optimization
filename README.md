@@ -13,6 +13,22 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
+## v2.0 — LLM-as-Judge (Aug 2026)
+
+The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** for three operations:
+
+| Operation | Old (v1.x) | New (v2.0) | Research basis |
+|-----------|-----------|-----------|----------------|
+| Importance classification | Hardcoded prefix matching | LLM-rated retention value (batched call) | Park et al. + Hindsight fact-extraction-as-filter |
+| Semantic dedup | Word overlap >60% | LLM judge identifies same-fact-different-wording | MenteDB `llm_consolidation`, 30-40% reduction |
+| Contradiction detection | Manual scan | LLM finds entity-drift pairs, auto-resolves state changes | Hindsight blog recency-wins policy |
+
+**LLM-optional** (MenteDB pattern): all operations degrade to rule-based fallbacks if the LLM endpoint is unavailable. The engine stays functional with no LLM.
+
+**Batch consolidation** (LycheeMemory V2 / RecMem): all entries sent in a single LLM call, not per-entry — 75-87% fewer LLM calls vs eager consolidation.
+
+**Non-destructive invalidation**: dedup and contradiction resolution use `PATCH {"state":"invalidated"}` (recall-hidden, retained on disk for audit). Never `DELETE`.
+
 ## Layer topology
 
 | Layer | Store | Holds | Rule of thumb |
@@ -28,11 +44,14 @@ A fact living in two layers belongs in the deepest layer that surfaces it reliab
 Copy into your Hermes skills directory:
 
 ```bash
-git clone https://github.com/david6055my/agent-memory-optimization.git
+git clone https://github.com/Green-Needle-Tech/agent-memory-optimization.git
 cp -r agent-memory-optimization/SKILL.md ~/.hermes/skills/productivity/memory-optimization/
+cp agent-memory-optimization/scripts/*.py ~/.hermes/scripts/
 ```
 
 Requires a Hermes Agent instance. The L2 procedure targets a [Hindsight](https://hindsight.vectorize.io) (Vectorize.io) server; the L3 procedure targets a Karpathy-pattern LLM Wiki. Both layers are optional — the L1 procedure works standalone.
+
+**LLM-as-judge** (v2.0): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `google/gemini-2.5-flash` by default (~$0.0001/call). Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks.
 
 ## Procedure (summary)
 
@@ -70,9 +89,11 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 2. Recall smoke-test (consolidation over-prune check)
 3. Retain smoke-test — `total_tokens > 0` proves fact extraction ran (health green ≠ writes working)
 4. Bank stats: node count + failed_operations trend vs last run
-5. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
-6. L1 capacity check (≥90% warns / triggers Hindsight offload)
-7. L3 wiki lint-lite (≥5 pages >90 days stale warns)
+5. **LLM semantic dedup pass** (NEW v2.0): recall recent memories (max 50), LLM identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
+6. **LLM contradiction scan** (NEW v2.0): recall recent memories, LLM finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts.
+7. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
+8. L1 capacity check (≥90% warns / triggers Hindsight offload — now LLM-driven classification)
+9. L3 wiki lint-lite (≥5 pages >90 days stale warns)
 
 Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
 
@@ -175,6 +196,12 @@ Key takeaway: the 402 error burst looked alarming in raw failed-op counts but wa
 - [Agent Memory Garbage Collection](https://tianpan.co/blog/2026-04-14-agent-memory-garbage-collection) (Apr 2026)
 - [Agent Memory vs RAG: What Breaks at Scale](https://ranksquire.com/2026/03/31/agent-memory-vs-rag-what-breaks-at-scale-2026/) (Mar 2026)
 - [Selective Retention and Forgetting Strategies](https://zylos.ai/en/research/2026-06-08-agent-memory-consolidation-selective-retention-forgetting/) (Zylos, Jun 2026)
+- [MenteDB llm_consolidation](https://docs.rs/mentedb/latest/mentedb/llm_consolidation/index.html) — LLM-as-judge for semantic dedup, LLM-optional design
+- [LycheeMemory V2](https://arxiv.org/html/2608.12990) — semantic segment-level consolidation, 86% fewer construction tokens
+- [RecMem](https://aclanthology.org/2026.findings-acl.1619/) (ACL 2026 Findings) — recurrence-based consolidation, 87% token reduction
+- [Human-Inspired Memory Architecture](https://arxiv.org/html/2605.08538v1) — dedup-based consolidation: 97.2% precision, 58% store reduction
+- [SCM: Sleep-Consolidated Memory](https://arxiv.org/html/2604.20943v1) — structured forgetting for LLM memory
+- [Agent Memory Techniques](https://github.com/NirDiamant/Agent_Memory_Techniques) — 30 runnable notebooks covering consolidation, compaction, forgetting
 
 ## License
 
