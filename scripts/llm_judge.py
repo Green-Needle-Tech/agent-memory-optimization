@@ -33,12 +33,12 @@ Configuration:
   Override via env: LLM_JUDGE_MODEL, LLM_JUDGE_BASE_URL, LLM_JUDGE_API_KEY.
 """
 
+import contextlib
 import json
 import os
 import re
-import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 # === Config ===
@@ -109,7 +109,7 @@ def _llm_chat(messages, model=None, max_tokens=None):
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:  # nosec B310
             data = json.loads(resp.read())
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception:
@@ -124,18 +124,14 @@ def _parse_json_response(text):
     text = re.sub(r"```(?:json)?\s*", "", text)
     text = text.replace("```", "").strip()
     # Try direct parse
-    try:
+    with contextlib.suppress(json.JSONDecodeError):
         return json.loads(text)
-    except json.JSONDecodeError:
-        pass
     # Find first { ... } or [ ... ] block
     for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
         match = re.search(pattern, text)
         if match:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 return json.loads(match.group())
-            except json.JSONDecodeError:
-                continue
     return None
 
 
@@ -199,14 +195,12 @@ def _fallback_contradictions(entries):
             words_a = set(entry_a.lower().split())
             words_b = set(entry_b.lower().split())
             shared_drift = any(k in words_a and k in words_b for k in drift_keywords)
-            if shared_drift:
-                # Check if values differ (simplified: different entries mentioning same domain)
-                if entry_a.strip() != entry_b.strip():
-                    contradictions.append({
-                        "pair": [i, j],
-                        "type": "possible_drift",
-                        "resolution": "flag_human",
-                    })
+            if shared_drift and entry_a.strip() != entry_b.strip():
+                contradictions.append({
+                    "pair": [i, j],
+                    "type": "possible_drift",
+                    "resolution": "flag_human",
+                })
     return contradictions
 
 
@@ -327,15 +321,15 @@ def detect_contradictions(entries):
 
     Identifies entity-drift pairs (old vs new state of the same fact) and
     stable-attribute conflicts. Resolution policy (Hindsight blog, May 2026):
-    - State changes → recency wins (invalidate old, keep new)
-    - Stable attributes that conflict → flag for human review
+    - State changes -> recency wins (invalidate old, keep new)
+    - Stable attributes that conflict -> flag for human review
 
     v2.0.1 prompt hardening (from live-run false positives):
     - Complementary pairs (policy vs capability, scope vs method) are NOT
       contradictions — only flag when both entries assert the same predicate
       about the same subject and cannot both be true.
     - Temporal markers ("now", "no longer", "was upgraded", "as of <date>")
-      signal a state_change → recency_wins, not a stable conflict.
+      signal a state_change -> recency_wins, not a stable conflict.
     - Meta-memories (reports ABOUT past conflicts/dedup runs) are noise:
       return them as type "meta_noise" so the caller can invalidate them.
 
@@ -379,9 +373,9 @@ def detect_contradictions(entries):
             f"    'invalidate_meta' (the report is stale bookkeeping, not a fact).\n\n"
             f"Entries:\n{numbered}\n\n"
             f"Respond with ONLY a JSON array: "
-            f"[{{\"pair\": [i, j], \"type\": \"state_change|stable_conflict|meta_noise\", "
-            f"\"resolution\": \"recency_wins|flag_human|invalidate_meta\", \"reason\": \"brief explanation\", "
-            f"\"newer_index\": i_or_j}}, ...]\n"
+            f'[{{"pair": [i, j], "type": "state_change|stable_conflict|meta_noise", '
+            f'"resolution": "recency_wins|flag_human|invalidate_meta", "reason": "brief explanation", '
+            f'"newer_index": i_or_j}}, ...]\n'
             f"Rules: report each unordered pair at most once; prefer the single clearest type per pair;\n"
             f"if no contradictions exist, respond with: []\n"
             f"Do not include any prose or markdown."

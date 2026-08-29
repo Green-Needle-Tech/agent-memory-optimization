@@ -41,20 +41,31 @@ Behavior (per memory-optimization skill v2.0.0):
 Output only when something needs attention; else silent. Exit 0 always
 (a crash is reported via stdout, never via nonzero exit).
 """
-import json, re, sys, time, hashlib, urllib.request, urllib.error
+
+import contextlib
+import hashlib
+import json
+import re
+import sys
+import time
+import types
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # LLM judge module (LLM-optional — degrades to rule-based if unavailable)
 sys.path.insert(0, str(Path(__file__).parent))
+llm_judge: types.ModuleType | None
 try:
-    import llm_judge  # noqa: E402
+    import llm_judge
 except ImportError:
     llm_judge = None  # standalone run: skip LLM-driven steps
 
 # Reuse the proven offload routine from the 30-min offload cron
 # (deployed copy lives next to this file in ~/.hermes/scripts/).
+memory_offload: types.ModuleType | None
 try:
-    import memory_offload  # noqa: E402
+    import memory_offload
 except ImportError:
     memory_offload = None  # standalone run: offload step will be skipped
 
@@ -101,7 +112,7 @@ def http(method, path, timeout=120, body=None):
         headers={"Content-Type": "application/json"},
         data=json.dumps(body).encode() if body is not None else None,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
         return r.status, json.loads(r.read() or b"{}")
     # urllib.error.HTTPError propagates to caller's try/except
 
@@ -201,9 +212,10 @@ def invalidate_meta_memories(memories, problems):
     """
     removed = 0
     for m in memories:
-        if META_MEMORY_RE.search(m.get("content", "")):
-            if invalidate_memory(m["id"], reason="meta_noise: report about a past maintenance run"):
-                removed += 1
+        if META_MEMORY_RE.search(m.get("content", "")) and invalidate_memory(
+            m["id"], reason="meta_noise: report about a past maintenance run"
+        ):
+            removed += 1
     if removed:
         problems.append(f"Self-pollution cleanup: {removed} meta-memories (reports about past runs) invalidated")
     return removed
@@ -239,10 +251,8 @@ def load_flag_state():
 
 def save_flag_state(flags):
     """Persist stable-conflict fingerprints so unresolved flags report once, not daily."""
-    try:
+    with contextlib.suppress(Exception):
         FLAG_STATE_FILE.write_text(json.dumps(sorted(flags)))
-    except Exception:
-        pass
 
 
 def flag_fingerprint(pair_contents):
@@ -292,6 +302,10 @@ def llm_semantic_dedup_pass(problems, memories=None):
         )
 
 
+def _normalize_text(s):
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
 def llm_contradiction_scan(problems, memories=None):
     """LLM-driven contradiction detection (Step 6, new in v2.0).
 
@@ -306,7 +320,7 @@ def llm_contradiction_scan(problems, memories=None):
 
     Research basis:
     - Hindsight blog: conflict handling — recency wins for state, source/confidence for stable
-    - Hindsight blog: entity drift (Postgres→MySQL) is the canonical failure
+    - Hindsight blog: entity drift (Postgres->MySQL) is the canonical failure
     """
     if llm_judge is None:
         return  # LLM unavailable — skip
@@ -347,16 +361,16 @@ def llm_contradiction_scan(problems, memories=None):
         elif resolution == "invalidate_meta":
             # The entry itself is a report about a past run — invalidate it
             for idx in pair:
-                if idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]):
-                    if invalidate_memory(memories[idx]["id"], reason="meta_noise: report about a past maintenance run"):
-                        invalidated += 1
+                if idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]) and invalidate_memory(
+                    memories[idx]["id"], reason="meta_noise: report about a past maintenance run"
+                ):
+                    invalidated += 1
         else:
             # Stable conflict — flag for human review (don't auto-resolve).
             # Guard 1: identical/near-identical contents are duplicates, not
             # conflicts — the judge occasionally mislabels them (observed live).
             pair_contents = [contents[pair[0]], contents[pair[1]]]
-            norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
-            a, b = norm(pair_contents[0]), norm(pair_contents[1])
+            a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
             # Guard 2: one content a prefix/subset of the other = same fact with
             # extra metadata — resolve as dedup (invalidate the shorter), not a flag.
             if a == b or a.startswith(b) or b.startswith(a):
@@ -466,10 +480,8 @@ def main():
         failed = stats.get("failed_operations", 0)
         prev_failed = 0
         if STATE_FILE.exists():
-            try:
+            with contextlib.suppress(Exception):
                 prev_failed = int(json.loads(STATE_FILE.read_text()).get("failed_operations", 0))
-            except Exception:
-                pass
         if failed >= FAILED_OPS_WARN or failed > prev_failed:
             problems.append(f"failed_operations={failed} (was {prev_failed}) — Hindsight writes failing silently; check backlog")
         STATE_FILE.write_text(json.dumps({"failed_operations": failed}))
@@ -514,12 +526,10 @@ def main():
                     mm = n.get("mental_model_id")
                     if not mm:
                         continue
-                    try:
+                    with contextlib.suppress(Exception):
                         _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=120)
                         if m.get("is_stale"):
                             stale.append(n)
-                    except Exception:
-                        pass  # per-page failure shouldn't kill the check
             else:
                 stale = [n for n in pages if n.get("is_stale")]
             if stale and len(stale) / len(pages) > KP_STALE_RATIO_WARN:
@@ -598,7 +608,7 @@ def main():
 
     # --- 9. Output ------------------------------------------------------
     if problems:
-        print(f"**🧠 Daily Memory Optimization — issues found**\n")
+        print("**🧠 Daily Memory Optimization — issues found**\n")
         for p in problems:
             print(f"  • {p}")
     # else: empty stdout -> cron stays silent

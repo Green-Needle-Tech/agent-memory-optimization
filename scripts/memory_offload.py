@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""
-Hindsight Memory Offload Script
+"""Hindsight Memory Offload Script.
+
 Runs via cron (no_agent=True). When local MEMORY.md exceeds 75% capacity,
 offloads non-essential entries to Hindsight and removes them from local memory.
 
@@ -25,21 +25,21 @@ Non-essential entries (offloaded to Hindsight, LLM-judged):
 """
 
 import json
-import os
-import re
 import sys
+import types
 import urllib.request
 from pathlib import Path
 
 # LLM judge module (LLM-optional — degrades to rule-based if unavailable)
 sys.path.insert(0, str(Path(__file__).parent))
+llm_judge: types.ModuleType | None
 try:
-    import llm_judge  # noqa: E402
+    import llm_judge
 except ImportError:
     llm_judge = None  # standalone run: use rule-based fallbacks
 
 # === Config ===
-MEMORY_FILE = os.path.expanduser("/root/.hermes/memories/MEMORY.md")
+MEMORY_FILE = Path("/root/.hermes/memories/MEMORY.md")
 HINDSIGHT_URL = "http://localhost:8888"
 BANK = "main"
 CAPACITY_MAX = 2200  # chars
@@ -70,36 +70,34 @@ TAG_MAP = {
     "coding-agent-orchestration": ["skills", "dev-workflow"],
 }
 
+
 def read_memory_file():
     """Read MEMORY.md and return list of entries (strings)."""
-    if not os.path.exists(MEMORY_FILE):
+    if not MEMORY_FILE.exists():
         return []
-    with open(MEMORY_FILE, "r") as f:
-        content = f.read()
+    content = MEMORY_FILE.read_text(encoding="utf-8")
     # Entries are separated by lines containing only '§'
-    if '§' in content:
-        raw_entries = content.split('§')
-    else:
-        raw_entries = [content]
+    raw_entries = content.split("§") if "§" in content else [content]
     entries = []
-    for entry in raw_entries:
-        entry = entry.strip()
-        if entry and not entry.startswith('#') and not entry.startswith('---'):
-            entries.append(entry)
+    for item in raw_entries:
+        stripped = item.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
+            entries.append(stripped)
     return entries
+
 
 def get_memory_usage():
     """Read raw char count from MEMORY.md."""
-    if not os.path.exists(MEMORY_FILE):
+    if not MEMORY_FILE.exists():
         return 0, CAPACITY_MAX
-    with open(MEMORY_FILE, "r") as f:
-        content = f.read()
-    if '§' in content:
-        entries = [e.strip() for e in content.split('§') if e.strip()]
+    content = MEMORY_FILE.read_text(encoding="utf-8")
+    if "§" in content:
+        entries = [e.strip() for e in content.split("§") if e.strip()]
         total_chars = sum(len(e) for e in entries)
     else:
         total_chars = len(content)
     return total_chars, CAPACITY_MAX
+
 
 def get_tags(entry):
     """Get appropriate tags for a Hindsight retain based on entry content."""
@@ -108,15 +106,17 @@ def get_tags(entry):
             return tags
     return ["offloaded", "memory-management"]
 
+
 def hindsight_health_check():
     """Check if Hindsight is healthy before offloading."""
     try:
         req = urllib.request.Request(f"{HINDSIGHT_URL}/health")
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:  # nosec B310
             data = json.loads(resp.read())
             return data.get("status") == "healthy"
     except Exception:
         return False
+
 
 def hindsight_recall_check(content):
     """Semantic recall to check if content is already in Hindsight (dedup).
@@ -131,9 +131,9 @@ def hindsight_recall_check(content):
             f"{HINDSIGHT_URL}/v1/default/banks/{BANK}/memories/recall",
             data=payload,
             headers={"Content-Type": "application/json"},
-            method="POST"
+            method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:  # nosec B310
             data = json.loads(resp.read())
             results = data.get("results", [])
             if not results:
@@ -142,7 +142,7 @@ def hindsight_recall_check(content):
             if llm_judge is not None:
                 result_texts = [r.get("content", "") or r.get("text", "") for r in results]
                 # Batch: check all recalled results against the entry in one LLM call
-                dup_groups = llm_judge.semantic_dedup([content] + result_texts[:5])
+                dup_groups = llm_judge.semantic_dedup([content, *result_texts[:5]])
                 for g in dup_groups:
                     if g["canonical"] == 0 and len(g["duplicates"]) > 0:
                         return True  # entry is duplicate of a recalled result
@@ -160,26 +160,28 @@ def hindsight_recall_check(content):
     except Exception:
         return False  # If recall fails, proceed with retain anyway
 
-def hindsight_retain(content, tags):
+
+def hindsight_retain(content, _tags=None):
     """Store an entry in Hindsight."""
     payload = json.dumps({"items": [{"content": content}]}).encode()
     req = urllib.request.Request(
         f"{HINDSIGHT_URL}/v1/default/banks/{BANK}/memories",
         data=payload,
         headers={"Content-Type": "application/json"},
-        method="POST"
+        method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:  # nosec B310
         data = json.loads(resp.read())
         success = data.get("success", False)
         tokens = data.get("usage", {}).get("total_tokens", 0)
         return success and tokens > 0
 
+
 def rewrite_memory_file(entries_to_keep):
     """Rewrite MEMORY.md with only the kept entries."""
-    with open(MEMORY_FILE, "w") as f:
-        for entry in entries_to_keep:
-            f.write(entry.strip() + "\n§\n")
+    content = "".join(f"{entry.strip()}\n§\n" for entry in entries_to_keep)
+    MEMORY_FILE.write_text(content, encoding="utf-8")
+
 
 def classify_entries(entries):
     """Classify entries as essential or offloadable.
@@ -196,6 +198,7 @@ def classify_entries(entries):
     essential = [e for e in entries if any(e.startswith(p) for p in ESSENTIAL_PREFIXES)]
     offloadable = [e for e in entries if not any(e.startswith(p) for p in ESSENTIAL_PREFIXES)]
     return essential, offloadable
+
 
 def main():
     # 1. Check Hindsight health
@@ -237,7 +240,7 @@ def main():
                 offloaded += 1
             else:
                 failed += 1
-        except Exception as e:
+        except Exception:
             failed += 1
 
     # 6. Rewrite local memory with only essential entries
