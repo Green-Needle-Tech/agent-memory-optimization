@@ -44,9 +44,19 @@ from pathlib import Path
 # === Config ===
 DEFAULT_MODEL = os.environ.get("LLM_JUDGE_MODEL", "google/gemini-2.5-flash")
 DEFAULT_BASE_URL = os.environ.get("LLM_JUDGE_BASE_URL", "https://openrouter.ai/api/v1")
-DEFAULT_MAX_TOKENS = 4000
+DEFAULT_MAX_TOKENS = 6000
 DEFAULT_TEMPERATURE = 0.1  # low temp for classification consistency
 REQUEST_TIMEOUT = 60
+BATCH_SIZE = 30  # max entries per LLM call — larger batches overflow the
+                 # response token budget, the JSON truncates, parsing fails,
+                 # and the caller silently degrades to rule-based fallback
+                 # (observed live: 85-entry batch -> fallback flagged 30+ pairs)
+
+
+def _chunk(items, size=BATCH_SIZE):
+    """Yield successive size-sized chunks from items."""
+    for i in range(0, len(items), size):
+        yield i, items[i:i + size]
 
 
 def _load_api_key():
@@ -220,35 +230,40 @@ def classify_importance(entries, context="L1 local memory for a Hermes AI agent"
     if not entries:
         return [], []
 
-    # Build a single batched prompt (LycheeMemory segment-level batching)
-    numbered = "\n".join(f"[{i}] {e}" for i, e in enumerate(entries))
-    prompt = (
-        f"You are a memory optimization judge for an AI agent's local memory ({context}).\n"
-        f"Local memory is injected every turn — every character costs attention.\n"
-        f"Classify each entry as 'essential' (must stay local: host specs, active config, "
-        f"tool quirks, recurring fixes) or 'offloadable' (stale-in-7-days facts, version numbers, "
-        f"one-time lessons, historical state — better stored in semantic recall).\n\n"
-        f"Entries:\n{numbered}\n\n"
-        f"Respond with ONLY a JSON object: {{\"essential\": [indices], \"offloadable\": [indices]}}\n"
-        f"Do not include any prose, explanation, or markdown."
-    )
+    essential, offloadable = [], []
+    for offset, chunk in _chunk(entries):
+        # Build a single batched prompt (LycheeMemory segment-level batching)
+        numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
+        prompt = (
+            f"You are a memory optimization judge for an AI agent's local memory ({context}).\n"
+            f"Local memory is injected every turn — every character costs attention.\n"
+            f"Classify each entry as 'essential' (must stay local: host specs, active config, "
+            f"tool quirks, recurring fixes) or 'offloadable' (stale-in-7-days facts, version numbers, "
+            f"one-time lessons, historical state — better stored in semantic recall).\n\n"
+            f"Entries:\n{numbered}\n\n"
+            f"Respond with ONLY a JSON object: {{\"essential\": [indices], \"offloadable\": [indices]}}\n"
+            f"Do not include any prose, explanation, or markdown."
+        )
 
-    resp = _llm_chat([{"role": "user", "content": prompt}])
-    parsed = _parse_json_response(resp)
+        resp = _llm_chat([{"role": "user", "content": prompt}])
+        parsed = _parse_json_response(resp)
 
-    if parsed and "essential" in parsed and "offloadable" in parsed:
-        essential = [int(i) for i in parsed["essential"] if isinstance(i, (int, float)) or str(i).isdigit()]
-        offloadable = [int(i) for i in parsed["offloadable"] if isinstance(i, (int, float)) or str(i).isdigit()]
-        # Validate: all indices accounted for
-        all_indices = set(range(len(entries)))
-        classified = set(essential) | set(offloadable)
-        unclassified = all_indices - classified
-        # Any unclassified go to offloadable (safe default)
-        offloadable.extend(unclassified)
-        return essential, offloadable
+        if parsed and "essential" in parsed and "offloadable" in parsed:
+            essential.extend(int(i) for i in parsed["essential"] if isinstance(i, (int, float)) or str(i).isdigit())
+            offloadable.extend(int(i) for i in parsed["offloadable"] if isinstance(i, (int, float)) or str(i).isdigit())
+        else:
+            # Fallback for this chunk: rule-based
+            fe, fo = _fallback_classify(chunk)
+            essential.extend(offset + i for i in fe)
+            offloadable.extend(offset + i for i in fo)
 
-    # Fallback: rule-based
-    return _fallback_classify(entries)
+    # Validate: all indices accounted for
+    all_indices = set(range(len(entries)))
+    classified = set(essential) | set(offloadable)
+    unclassified = all_indices - classified
+    # Any unclassified go to offloadable (safe default)
+    offloadable.extend(unclassified)
+    return essential, offloadable
 
 
 def semantic_dedup(entries):
@@ -269,35 +284,42 @@ def semantic_dedup(entries):
     if len(entries) < 2:
         return []
 
-    numbered = "\n".join(f"[{i}] {e}" for i, e in enumerate(entries))
-    prompt = (
-        f"You are a semantic deduplication judge for AI agent memory.\n"
-        f"Identify groups of entries that express the SAME underlying fact or preference "
-        f"with different wording. Only group genuine semantic duplicates — not entries that "
-        f"merely share a topic.\n\n"
-        f"Entries:\n{numbered}\n\n"
-        f"Respond with ONLY a JSON array of groups: "
-        f"[{{\"canonical\": idx, \"duplicates\": [idx, ...]}}, ...]\n"
-        f"Each group must have exactly one canonical (the best-worded entry) and at least one duplicate.\n"
-        f"If no duplicates exist, respond with: []\n"
-        f"Do not include any prose or markdown."
-    )
+    groups = []
+    for offset, chunk in _chunk(entries):
+        numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
+        prompt = (
+            f"You are a semantic deduplication judge for AI agent memory.\n"
+            f"Identify groups of entries that express the SAME underlying fact or preference.\n"
+            f"This includes verbatim or near-verbatim copies, and same fact with different wording\n"
+            f"(e.g., \"User prefers Python\" vs \"User's primary language is Python\"). Only group\n"
+            f"genuine duplicates — not entries that merely share a topic.\n\n"
+            f"Entries:\n{numbered}\n\n"
+            f"Respond with ONLY a JSON array of groups: "
+            f"[{{\"canonical\": idx, \"duplicates\": [idx, ...]}}, ...]\n"
+            f"Each group must have exactly one canonical (the best-worded entry) and at least one duplicate.\n"
+            f"If no duplicates exist, respond with: []\n"
+            f"Do not include any prose or markdown."
+        )
 
-    resp = _llm_chat([{"role": "user", "content": prompt}])
-    parsed = _parse_json_response(resp)
+        resp = _llm_chat([{"role": "user", "content": prompt}])
+        parsed = _parse_json_response(resp)
 
-    if parsed is not None and isinstance(parsed, list):
-        groups = []
-        for g in parsed:
-            if isinstance(g, dict) and "canonical" in g and "duplicates" in g:
-                canonical = int(g["canonical"])
-                dups = [int(d) for d in g["duplicates"]]
-                if dups:  # only include groups with at least one duplicate
-                    groups.append({"canonical": canonical, "duplicates": dups})
-        return groups
+        if parsed is not None and isinstance(parsed, list):
+            for g in parsed:
+                if isinstance(g, dict) and "canonical" in g and "duplicates" in g:
+                    canonical = int(g["canonical"])
+                    dups = [int(d) for d in g["duplicates"]]
+                    if dups:  # only include groups with at least one duplicate
+                        groups.append({"canonical": canonical, "duplicates": dups})
+        else:
+            # Fallback for this chunk: word-overlap
+            for g in _fallback_dedup(chunk):
+                groups.append({
+                    "canonical": offset + g["canonical"],
+                    "duplicates": [offset + d for d in g["duplicates"]],
+                })
 
-    # Fallback: word-overlap
-    return _fallback_dedup(entries)
+    return groups
 
 
 def detect_contradictions(entries):
@@ -307,6 +329,15 @@ def detect_contradictions(entries):
     stable-attribute conflicts. Resolution policy (Hindsight blog, May 2026):
     - State changes → recency wins (invalidate old, keep new)
     - Stable attributes that conflict → flag for human review
+
+    v2.0.1 prompt hardening (from live-run false positives):
+    - Complementary pairs (policy vs capability, scope vs method) are NOT
+      contradictions — only flag when both entries assert the same predicate
+      about the same subject and cannot both be true.
+    - Temporal markers ("now", "no longer", "was upgraded", "as of <date>")
+      signal a state_change → recency_wins, not a stable conflict.
+    - Meta-memories (reports ABOUT past conflicts/dedup runs) are noise:
+      return them as type "meta_noise" so the caller can invalidate them.
 
     Args:
         entries: list of memory entry strings
@@ -318,43 +349,66 @@ def detect_contradictions(entries):
     if len(entries) < 2:
         return []
 
-    numbered = "\n".join(f"[{i}] {e}" for i, e in enumerate(entries))
-    prompt = (
-        f"You are a contradiction detector for AI agent memory.\n"
-        f"Find pairs of entries that contradict each other — same entity/fact but different values.\n"
-        f"Two types:\n"
-        f"  - 'state_change': the newer entry supersedes the old (e.g., provider switched, URL changed). "
-        f"    Resolution: 'recency_wins' (invalidate the older entry).\n"
-        f"  - 'stable_conflict': both entries claim different stable attributes for the same entity. "
-        f"    Resolution: 'flag_human' (needs human review).\n\n"
-        f"Entries:\n{numbered}\n\n"
-        f"Respond with ONLY a JSON array: "
-        f"[{{\"pair\": [i, j], \"type\": \"state_change|stable_conflict\", "
-        f"\"resolution\": \"recency_wins|flag_human\", \"reason\": \"brief explanation\", "
-        f"\"newer_index\": i_or_j}}, ...]\n"
-        f"If no contradictions exist, respond with: []\n"
-        f"Do not include any prose or markdown."
-    )
+    contradictions = []
+    for offset, chunk in _chunk(entries):
+        numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
+        prompt = (
+            f"You are a contradiction detector for AI agent memory.\n"
+            f"Find pairs of entries that genuinely contradict each other: both assert the SAME\n"
+            f"predicate about the same subject, and both cannot be true at once.\n\n"
+            f"NOT contradictions (do not report these):\n"
+            f"  - Complementary facts: one entry states a POLICY or preference (\"preferred method\n"
+            f"    is X\"), the other states a CAPABILITY or constraint (\"the agent cannot auto-edit\n"
+            f"    config files\"). Different predicates — both can be true.\n"
+            f"  - Different scope or aspect of the same system (e.g. one about the reload endpoint,\n"
+            f"    another about the file watcher).\n"
+            f"  - Entries that merely share a topic or entity name.\n"
+            f"  - Duplicates or near-identical entries (same fact, same claim): duplicates are NOT\n"
+            f"    contradictions — leave them to the dedup pass. Never report them here.\n"
+            f"  - A report ABOUT a past conflict/dedup run (\"a conflict was flagged regarding X\")\n"
+            f"    vs any other entry — that is meta-noise, not a fact about the world.\n\n"
+            f"Two contradiction types:\n"
+            f"  - 'state_change': the newer entry supersedes the old (provider switched, URL changed,\n"
+            f"    version upgraded, feature that 'was never read' now works). Temporal markers\n"
+            f"    (\"now\", \"no longer\", \"was upgraded\", \"as of <date>\", \"completed on <date>\")\n"
+            f"    usually indicate this. Resolution: 'recency_wins' (invalidate the older entry).\n"
+            f"  - 'stable_conflict': both entries claim different stable attributes for the same\n"
+            f"    entity, with no temporal ordering. Resolution: 'flag_human'.\n"
+            f"  - 'meta_noise': one entry is itself a report about a past conflict/dedup run\n"
+            f"    (\"a conflict was flagged...\", \"N duplicates were invalidated...\"). Resolution:\n"
+            f"    'invalidate_meta' (the report is stale bookkeeping, not a fact).\n\n"
+            f"Entries:\n{numbered}\n\n"
+            f"Respond with ONLY a JSON array: "
+            f"[{{\"pair\": [i, j], \"type\": \"state_change|stable_conflict|meta_noise\", "
+            f"\"resolution\": \"recency_wins|flag_human|invalidate_meta\", \"reason\": \"brief explanation\", "
+            f"\"newer_index\": i_or_j}}, ...]\n"
+            f"Rules: report each unordered pair at most once; prefer the single clearest type per pair;\n"
+            f"if no contradictions exist, respond with: []\n"
+            f"Do not include any prose or markdown."
+        )
 
-    resp = _llm_chat([{"role": "user", "content": prompt}])
-    parsed = _parse_json_response(resp)
+        resp = _llm_chat([{"role": "user", "content": prompt}])
+        parsed = _parse_json_response(resp)
 
-    if parsed is not None and isinstance(parsed, list):
-        contradictions = []
-        for c in parsed:
-            if isinstance(c, dict) and "pair" in c:
-                pair = [int(c["pair"][0]), int(c["pair"][1])]
-                contradictions.append({
-                    "pair": pair,
-                    "type": c.get("type", "unknown"),
-                    "resolution": c.get("resolution", "flag_human"),
-                    "reason": c.get("reason", ""),
-                    "newer_index": c.get("newer_index"),
-                })
-        return contradictions
+        if parsed is not None and isinstance(parsed, list):
+            for c in parsed:
+                if isinstance(c, dict) and "pair" in c:
+                    try:
+                        pair = [int(c["pair"][0]), int(c["pair"][1])]
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    contradictions.append({
+                        "pair": pair,
+                        "type": c.get("type", "unknown"),
+                        "resolution": c.get("resolution", "flag_human"),
+                        "reason": c.get("reason", ""),
+                        "newer_index": c.get("newer_index"),
+                    })
+        else:
+            # Fallback for this chunk: keyword-based
+            contradictions.extend(_fallback_contradictions(chunk))
 
-    # Fallback: keyword-based
-    return _fallback_contradictions(entries)
+    return contradictions
 
 
 def is_llm_available():

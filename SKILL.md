@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 2.0.0
+version: 2.0.1
 author: Iris
 license: MIT
 trigger: >-
@@ -158,6 +158,15 @@ Manual runs of this skill are for deep maintenance: USER.md prunes, L2 dedup/con
 - Don't create L3 pages for passing mentions (2+ source rule) — the #1 wiki bloat source.
 - Near-duplicates evade exact-match dedup — always dedup semantically (recall + overlap check), not by string compare.
 - Stale facts are confidently wrong, not obviously wrong — after backlog replays or model switches, actively recall-test known-current facts (e.g. David's trip.com-only rule) and invalidate resurrected stale guidance.
+
+### LLM-judge pitfalls (v2.0.1, from live daily runs)
+- **Batch size overflow → silent fallback.** >30 entries per LLM call overflows the response token budget; the JSON truncates, parsing fails, and the judge silently degrades to the noisy rule-based fallback (observed: an 85-entry batch flagged 30+ pairs with empty reasons). Always chunk (`BATCH_SIZE = 30` in `llm_judge.py`); per-chunk fallback is fine.
+- **Self-pollution loop.** The daily script's own outputs (smoke-test probes, "a conflict was flagged…" reports) become memories that the next run's scans flag against everything. Fixes: tag smoke-test probes and retire them after 48h; invalidate meta-memories (reports about past runs) on sight; never retain run reports as memories.
+- **Derived facts can't be PATCHed.** `observation`-type memories return 400 on invalidation — invalidate their `world`/`experience` sources instead (`GET /memories/{id}` → `source_memory_ids`). Fact extraction also rewrites retained content ("daily memory optimization smoke test 2026-08-29" becomes "David performed a daily memory optimization smoke test"), so content-prefix matching must be fuzzy.
+- **Complementary ≠ contradictory.** "Preferred method is X" (policy) vs "agent cannot auto-edit config" (capability) are different predicates — both true. The judge prompt now states this explicitly; temporal markers ("now", "was upgraded", "completed on <date>") route pairs to recency-wins instead of flag-human.
+- **Judge mislabels duplicates as conflicts.** When its own reason says "identical/duplicate", trust the diagnosis over the type label — resolve as dedup. Code guards: exact-normalized match, prefix/subset match, and reason-keyword match all resolve as dedup instead of flagging.
+- **Shared recall set.** Dedup and contradiction passes must scan the same recalled memories (one broad query) — different queries meant duplicates the contradiction scan saw never reached the dedup pass.
+- **Flag fatigue.** Stable-conflict flags are fingerprinted (order-independent content hash) and persisted; an unresolved flag reports once, not every day.
 
 ## Sources
 - Hindsight blog: The Consolidation Problem in Agent Memory (May 2026) — four-lever framework, write-time filtering, eviction-for-compliance-only.

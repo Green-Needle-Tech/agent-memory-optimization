@@ -9,6 +9,18 @@ v2.0 (Aug 2026): LLM-driven semantic dedup + contradiction detection.
   - LLM-optional: degrades to rule-based if LLM unavailable
   - Batch consolidation: all memories in one LLM call (LycheeMemory V2 pattern)
 
+v2.0.1 (Aug 2026): self-pollution fixes from live-run false positives.
+  - Smoke-test probe memories are tagged and retired after 48h (30 had accumulated)
+  - Meta-memories (reports ABOUT past maintenance runs) invalidated on sight —
+    they previously flagged against every related fact, every day
+  - Exact-duplicate pre-pass before the LLM (verbatim copies need no judge)
+  - One shared recall set feeds both dedup and contradiction passes
+    (previously different queries meant duplicates never reached dedup)
+  - Contradiction prompt hardened: complementary pairs (policy vs capability)
+    are not conflicts; temporal markers route state changes to recency-wins
+  - Stable-conflict flags deduped across runs via fingerprint state file
+    (an unresolved flag reports once, not daily)
+
 Behavior (per memory-optimization skill v2.0.0):
   L2 (Hindsight, any 0.8+; Knowledge Pages checks activate on 0.9+):
     1. POST /consolidate -> poll operation to terminal state (max 8 min)
@@ -29,7 +41,7 @@ Behavior (per memory-optimization skill v2.0.0):
 Output only when something needs attention; else silent. Exit 0 always
 (a crash is reported via stdout, never via nonzero exit).
 """
-import json, sys, time, urllib.request, urllib.error
+import json, re, sys, time, hashlib, urllib.request, urllib.error
 from pathlib import Path
 
 # LLM judge module (LLM-optional — degrades to rule-based if unavailable)
@@ -65,6 +77,22 @@ STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_state.json")
 DEDUP_RECALL_LIMIT = 50      # max memories to recall for LLM dedup/contradiction scan
 DEDUP_RECALL_TOKENS = 3000   # token budget for recall query
 
+# v2.0.1: self-pollution guards
+SMOKE_TEST_TAG = "daily-memopt-smoke"   # tag on the retain smoke-test memory
+SMOKE_TEST_MAX_AGE_S = 172800           # smoke-test memories older than 48h = junk
+META_MEMORY_PATTERNS = [                # reports ABOUT past maintenance runs = noise
+    r"stable-attribute conflict was flagged",
+    r"conflict was flagged",
+    r"duplicates? (?:were|was) invalidated",
+    r"memor(?:y|ies) (?:were|was) invalidated",
+    r"invalidated \(non-destructive",
+    r"recency-wins",
+    r"needs? review",
+    r"flagged for (?:human )?review",
+]
+META_MEMORY_RE = re.compile("|".join(META_MEMORY_PATTERNS), re.IGNORECASE)
+FLAG_STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_flags.json")
+
 
 def http(method, path, timeout=120, body=None):
     req = urllib.request.Request(
@@ -85,7 +113,7 @@ def walk_tree(nodes):
         yield from walk_tree(n.get("children"))
 
 
-def recall_recent_memories(query="user preferences, environment, configuration, tools"):
+def recall_recent_memories(query="user preferences, environment, configuration, tools", limit=None):
     """Recall recent memories for LLM-driven dedup + contradiction scan.
 
     Returns list of {id, content} dicts, or empty list on failure.
@@ -100,7 +128,7 @@ def recall_recent_memories(query="user preferences, environment, configuration, 
             content = h.get("content", "") or h.get("text", "")
             if mid and content:
                 memories.append({"id": mid, "content": content})
-        return memories[:DEDUP_RECALL_LIMIT]
+        return memories[:(limit or DEDUP_RECALL_LIMIT)]
     except Exception:
         return []
 
@@ -118,12 +146,120 @@ def invalidate_memory(mid, reason="duplicate"):
         return False
 
 
-def llm_semantic_dedup_pass(problems):
+def recall_all_recent(limit=DEDUP_RECALL_LIMIT):
+    """Recall a broad mix of recent memories (single shared set for dedup + contradictions).
+
+    v2.0.1: dedup and contradiction scans previously used different recall queries,
+    so duplicates the contradiction scan saw never reached the dedup pass. One
+    broad recall now feeds both passes, keeping indices consistent.
+    """
+    return recall_recent_memories(
+        query="user preferences, environment, configuration, tools, versions, migrations, decisions",
+        limit=limit,
+    )
+
+
+def cleanup_smoke_tests(problems):
+    """Invalidate old smoke-test memories (v2.0.1 self-pollution fix).
+
+    The retain smoke-test writes a memory every run; without cleanup they
+    accumulate forever (30 found in one bank). Each new smoke-test memory is
+    tagged SMOKE_TEST_TAG; anything tagged and older than SMOKE_TEST_MAX_AGE_S
+    is invalidated. Legacy untagged ones are matched by content prefix.
+    """
+    cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - SMOKE_TEST_MAX_AGE_S))
+    removed = 0
+    try:
+        _, resp = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=120,
+                       body={"query": "daily memory optimization smoke test", "max_tokens": 2000})
+        hits = resp.get("results") or resp.get("memories") or resp.get("items") or []
+        for h in hits:
+            content = (h.get("content") or h.get("text") or "")
+            tags = [str(t).lower() for t in (h.get("tags") or [])]
+            is_smoke = SMOKE_TEST_TAG in tags or content.startswith("daily memory optimization smoke test")
+            if not is_smoke:
+                continue
+            # Date embedded in content; invalidate only if older than the cutoff
+            m = re.search(r"smoke test (\d{4}-\d{2}-\d{2})", content)
+            if m and m.group(1) > cutoff:
+                continue  # recent — keep (it's this run's probe)
+            if invalidate_memory(h.get("id") or h.get("memory_id"), reason="smoke_test_junk"):
+                removed += 1
+    except Exception:
+        return  # cleanup is best-effort; never block the run
+    if removed:
+        problems.append(f"Self-pollution cleanup: {removed} old smoke-test memories invalidated")
+
+
+def invalidate_meta_memories(memories, problems):
+    """Invalidate meta-memories: reports ABOUT past maintenance runs (v2.0.1).
+
+    Past runs' problem reports were retained as memories ("a stable-attribute
+    conflict was flagged regarding X"). Those reports then flag against every
+    related fact on every subsequent run — self-referential noise. They are
+    bookkeeping, not facts; invalidate on sight.
+    """
+    removed = 0
+    for m in memories:
+        if META_MEMORY_RE.search(m.get("content", "")):
+            if invalidate_memory(m["id"], reason="meta_noise: report about a past maintenance run"):
+                removed += 1
+    if removed:
+        problems.append(f"Self-pollution cleanup: {removed} meta-memories (reports about past runs) invalidated")
+    return removed
+
+
+def exact_duplicate_prepass(memories):
+    """Invalidate verbatim duplicates before the LLM passes (v2.0.1).
+
+    Exact copies (same normalized content) need no LLM call — collapse them
+    deterministically, keeping the first occurrence. Returns count removed.
+    """
+    seen = {}
+    removed = 0
+    for m in memories:
+        key = hashlib.sha256(
+            re.sub(r"\s+", " ", m["content"]).strip().lower().encode()
+        ).hexdigest()
+        if key in seen:
+            if invalidate_memory(m["id"], reason="exact_duplicate"):
+                removed += 1
+        else:
+            seen[key] = m["id"]
+    return removed
+
+
+def load_flag_state():
+    """Load previously-reported stable-conflict fingerprints (cross-run dedup)."""
+    try:
+        return set(json.loads(FLAG_STATE_FILE.read_text()))
+    except Exception:
+        return set()
+
+
+def save_flag_state(flags):
+    """Persist stable-conflict fingerprints so unresolved flags report once, not daily."""
+    try:
+        FLAG_STATE_FILE.write_text(json.dumps(sorted(flags)))
+    except Exception:
+        pass
+
+
+def flag_fingerprint(pair_contents):
+    """Stable fingerprint for a flagged pair (order-independent, content-based)."""
+    a, b = sorted(pair_contents)
+    return hashlib.sha256(f"{a}||{b}".encode()).hexdigest()
+
+
+def llm_semantic_dedup_pass(problems, memories=None):
     """LLM-driven semantic dedup pass (Step 5, new in v2.0).
 
     Recalls recent memories, uses LLM to identify semantic near-duplicates
     (same fact, different wording), and invalidates the duplicates via PATCH
     (non-destructive: state=invalidated, retained on disk for audit).
+
+    v2.0.1: accepts a pre-recalled shared memory list (same set feeds the
+    contradiction scan, keeping indices consistent).
 
     Research basis:
     - MenteDB llm_consolidation: LLM-as-judge for semantic dedup
@@ -133,7 +269,8 @@ def llm_semantic_dedup_pass(problems):
     if llm_judge is None:
         return  # LLM unavailable — skip (rule-based dedup happens in Hindsight's own consolidation)
 
-    memories = recall_recent_memories()
+    if memories is None:
+        memories = recall_all_recent()
     if len(memories) < 2:
         return  # nothing to dedup
 
@@ -142,7 +279,6 @@ def llm_semantic_dedup_pass(problems):
 
     invalidated = 0
     for group in dup_groups:
-        canonical_idx = group["canonical"]
         for dup_idx in group["duplicates"]:
             if dup_idx < len(memories):
                 mid = memories[dup_idx]["id"]
@@ -156,12 +292,17 @@ def llm_semantic_dedup_pass(problems):
         )
 
 
-def llm_contradiction_scan(problems):
+def llm_contradiction_scan(problems, memories=None):
     """LLM-driven contradiction detection (Step 6, new in v2.0).
 
     Recalls recent memories, uses LLM to find entity-drift pairs (old vs new
     state of the same fact), and applies recency-wins invalidation for state
     changes. Stable-attribute conflicts are flagged for human review.
+
+    v2.0.1: handles the 'meta_noise' type (invalidate the report memory),
+    dedups flagged pairs across runs via a fingerprint state file (an
+    unresolved flag reports once, not every day), and shares the recall set
+    with the dedup pass.
 
     Research basis:
     - Hindsight blog: conflict handling — recency wins for state, source/confidence for stable
@@ -170,9 +311,8 @@ def llm_contradiction_scan(problems):
     if llm_judge is None:
         return  # LLM unavailable — skip
 
-    memories = recall_recent_memories(
-        query="provider, model, url, port, version, configuration changes, migrations"
-    )
+    if memories is None:
+        memories = recall_all_recent()
     if len(memories) < 2:
         return  # nothing to scan
 
@@ -181,8 +321,18 @@ def llm_contradiction_scan(problems):
 
     invalidated = 0
     flagged = 0
+    seen_pairs = set()
+    prev_flags = load_flag_state()
+    new_flags = set()
+
     for c in contradictions:
         pair = c["pair"]
+        # Normalize unordered pair; skip if already handled this run
+        key = tuple(sorted(pair))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+
         resolution = c.get("resolution", "flag_human")
         reason = c.get("reason", "")
         newer_idx = c.get("newer_index")
@@ -194,13 +344,42 @@ def llm_contradiction_scan(problems):
                 mid = memories[older_idx]["id"]
                 if invalidate_memory(mid, reason=f"superseded: {reason}"):
                     invalidated += 1
+        elif resolution == "invalidate_meta":
+            # The entry itself is a report about a past run — invalidate it
+            for idx in pair:
+                if idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]):
+                    if invalidate_memory(memories[idx]["id"], reason="meta_noise: report about a past maintenance run"):
+                        invalidated += 1
         else:
-            # Stable conflict — flag for human review (don't auto-resolve)
+            # Stable conflict — flag for human review (don't auto-resolve).
+            # Guard 1: identical/near-identical contents are duplicates, not
+            # conflicts — the judge occasionally mislabels them (observed live).
+            pair_contents = [contents[pair[0]], contents[pair[1]]]
+            norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+            a, b = norm(pair_contents[0]), norm(pair_contents[1])
+            # Guard 2: one content a prefix/subset of the other = same fact with
+            # extra metadata — resolve as dedup (invalidate the shorter), not a flag.
+            if a == b or a.startswith(b) or b.startswith(a):
+                shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
+                if invalidate_memory(memories[shorter_idx]["id"], reason="semantic_duplicate (near-verbatim pair)"):
+                    invalidated += 1
+                continue
+            # Guard 3: judge's own reason says duplicate — trust the diagnosis
+            # over the type label and resolve as dedup.
+            if re.search(r"duplicat|identical", reason, re.IGNORECASE):
+                shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
+                if invalidate_memory(memories[shorter_idx]["id"], reason=f"semantic_duplicate (judge reason: {reason[:80]})"):
+                    invalidated += 1
+                continue
+            # Cross-run dedup: only report pairs not already flagged before.
+            fp = flag_fingerprint(pair_contents)
+            if fp in prev_flags:
+                continue  # already reported in a previous run — stay silent
+            new_flags.add(fp)
             flagged += 1
-            pair_contents = [contents[pair[0]][:60], contents[pair[1]][:60]]
             problems.append(
                 f"LLM contradiction scan: stable-attribute conflict needs review — "
-                f"[{pair_contents[0]}] vs [{pair_contents[1]}] ({reason})"
+                f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
             )
 
     if invalidated > 0:
@@ -208,6 +387,8 @@ def llm_contradiction_scan(problems):
             f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
             f"(recency-wins, non-destructive)"
         )
+    if new_flags:
+        save_flag_state(prev_flags | new_flags)
 
 
 def main():
@@ -258,9 +439,14 @@ def main():
     # --- 3b. Retain smoke-test (silent write-failure check) -------------
     # success:true with total_tokens == 0 means fact extraction did NOT run
     # (the exact step that fails on broken auth / bad LLM while health is green).
+    # v2.0.1: the probe memory is tagged so cleanup_smoke_tests can retire it
+    # once stale — untagged probes accumulated 30+ in the bank.
     try:
         _, ret = http("POST", f"/v1/default/banks/{BANK}/memories", timeout=120,
-                      body={"items": [{"content": f"daily memory optimization smoke test {time.strftime('%Y-%m-%d')}"}]})
+                      body={"items": [{
+                          "content": f"daily memory optimization smoke test {time.strftime('%Y-%m-%d')}",
+                          "tags": [SMOKE_TEST_TAG],
+                      }]})
         usage = (ret.get("usage") or {})
         if not ret.get("success"):
             problems.append(f"Retain smoke-test failed: success != true ({str(ret)[:120]})")
@@ -290,21 +476,25 @@ def main():
     except Exception as e:
         problems.append(f"Bank stats fetch failed: {type(e).__name__}: {e}")
 
-    # --- 5. LLM semantic dedup pass (NEW in v2.0) ----------------------
-    # Recall recent memories, LLM identifies near-duplicates, invalidate
-    # (non-destructive). Research: 30-40% reduction on polluted stores.
+    # --- 5. LLM dedup + contradiction passes (v2.0, restructured v2.0.1) -
+    # One shared recall feeds both passes (consistent indices), after:
+    #   a. smoke-test cleanup (old probes invalidated)
+    #   b. meta-memory invalidation (reports about past runs = noise)
+    #   c. exact-duplicate pre-pass (no LLM needed for verbatim copies)
     try:
-        llm_semantic_dedup_pass(problems)
+        cleanup_smoke_tests(problems)
+        memories = recall_all_recent()
+        if memories:
+            invalidate_meta_memories(memories, problems)
+            exact_dupes = exact_duplicate_prepass(memories)
+            if exact_dupes:
+                problems.append(f"Exact-duplicate pre-pass: {exact_dupes} verbatim copies invalidated")
+            # Drop memories invalidated by the pre-passes before the LLM sees them
+            memories = [m for m in memories if not META_MEMORY_RE.search(m["content"])]
+        llm_semantic_dedup_pass(problems, memories=memories)
+        llm_contradiction_scan(problems, memories=memories)
     except Exception as e:
-        problems.append(f"LLM semantic dedup pass failed: {type(e).__name__}: {e}")
-
-    # --- 6. LLM contradiction scan (NEW in v2.0) -----------------------
-    # Recall recent memories, LLM finds entity-drift pairs, apply
-    # recency-wins invalidation or flag for human review.
-    try:
-        llm_contradiction_scan(problems)
-    except Exception as e:
-        problems.append(f"LLM contradiction scan failed: {type(e).__name__}: {e}")
+        problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
 
     # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) -------------
     # A page is a projected view over memory — it inherits L2's failure
