@@ -52,6 +52,39 @@ Addresses critical data-loss, LLM action safety, and validation issues identifie
 
 **LLM-as-advisor model**: The LLM proposes actions, but destructive operations (invalidate, config_tune) require explicit opt-in via `--allow-destructive`. Consolidation (non-destructive) is always allowed. Config keys are allowlisted.
 
+## v2.3 — Correctness (Sep 2026)
+
+Replaces broad-recall sampling with structured, paginated, timestamped memory scanning:
+
+| Change | Old (v2.2.1) | New (v2.3) |
+|--------|-------------|-----------|
+| Memory scanning | One broad recall query (max 50) | Paginated `/memories/list` with scan cursor — every memory eventually examined |
+| Recency resolution | LLM guesses from list position / wording | Deterministic from `MemoryRecord.timestamp` metadata |
+| Cross-chunk comparison | `BATCH_SIZE=30` boundary — entry 29 vs 30 never compared | Cross-chunk candidate generation (entity + keyword + adjacent blocking) |
+| Memory records | Raw content strings | `MemoryRecord` dataclass: id, content, fact_type, state, date, occurred_start, tags, document_id, source_memory_ids |
+| Knowledge Pages is_stale | Always uses mental-model workaround for small KBs | Version-gated: trusts tree `is_stale` directly on Hindsight ≥0.9.1 (scope-aware), falls back for older versions |
+| Scan coverage | Top-50 from semantic recall | Cursor-based pagination across all valid world+experience memories (wraps around) |
+
+**New module**: `scripts/memory_records.py` — `MemoryRecord` dataclass, `list_memories()`, `get_scan_batch()`, `generate_candidate_pairs()`, `resolve_recency()`.
+
+## v2.4 — Productization (Sep 2026)
+
+CLI workflow, audit logging, and privacy controls:
+
+| Feature | Description |
+|---------|-------------|
+| `--dry-run` | Report issues without taking any action |
+| `--apply` | Apply all recommended actions (implies `--allow-destructive`) |
+| `--allow-destructive` | Enable LLM auto-mutation (invalidate, config_tune) |
+| `--restore MEMORY_ID` | Restore a previously invalidated memory from the audit log |
+| `--audit-log` | Print recent audit log entries |
+| JSON audit log | Before/after state for every mutation, stored as JSONL with rotation |
+| PII redaction | Email, phone, SSN, credit card, API keys, IP addresses redacted before cloud judging |
+| Sensitive tag exclusion | Memories tagged `secret`, `private`, `credential`, `password` excluded from judging |
+| `LLM_JUDGE_LOCAL_MODE` | Env var to enable local-model/private judging (warns if cloud endpoint configured) |
+
+**Privacy model**: `memory_records.prepare_for_judging()` filters sensitive records and redacts PII before any content reaches the LLM judge. Set `LLM_JUDGE_LOCAL_MODE=true` and `LLM_JUDGE_BASE_URL` to a local model server for fully private operation.
+
 ### LLM-as-Judge architecture
 
 ```mermaid

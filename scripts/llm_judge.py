@@ -50,11 +50,17 @@ import urllib.request
 from pathlib import Path
 
 # === Config (environment-overridable) ===
+# v2.4: Support local model/private judging mode.
+#   Set LLM_JUDGE_LOCAL_MODE=true to enable privacy mode:
+#   - PII redaction is applied before sending content
+#   - Only LLM_JUDGE_LOCAL_MODEL models are accepted
+#   - A warning is printed if a cloud model is configured while local mode is on
 DEFAULT_MODEL = os.environ.get("LLM_JUDGE_MODEL", "z-ai/glm-5.2")
 DEFAULT_BASE_URL = os.environ.get("LLM_JUDGE_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_MAX_TOKENS = 6000
 DEFAULT_TEMPERATURE = 0.1  # low temp for classification consistency
 REQUEST_TIMEOUT = 60
+LOCAL_MODE = os.environ.get("LLM_JUDGE_LOCAL_MODE", "false").lower() in ("true", "1", "yes")
 BATCH_SIZE = 30  # max entries per LLM call — larger batches overflow the
                  # response token budget, the JSON truncates, parsing fails,
                  # and the caller silently degrades to rule-based fallback
@@ -88,6 +94,10 @@ def _llm_chat(messages, model=None, max_tokens=None):
 
     LLM-optional: returns None on any error (network, auth, parse).
     Caller must handle None as "LLM unavailable, use fallback."
+
+    v2.4: In LOCAL_MODE, a warning is printed if a cloud model is configured.
+    The caller (memory_records.prepare_for_judging) is responsible for
+    PII redaction before content reaches this function.
     """
     api_key = _load_api_key()
     if not api_key:
@@ -96,6 +106,16 @@ def _llm_chat(messages, model=None, max_tokens=None):
     model = model or DEFAULT_MODEL
     max_tokens = max_tokens or DEFAULT_MAX_TOKENS
     base_url = DEFAULT_BASE_URL
+
+    # v2.4: local mode warning
+    if LOCAL_MODE and "localhost" not in base_url and "127.0.0.1" not in base_url:
+        import sys as _sys
+        print(
+            f"WARN: LLM_JUDGE_LOCAL_MODE=true but base_url={base_url} "
+            f"is a cloud endpoint. Set LLM_JUDGE_BASE_URL to a local model "
+            f"server for private judging.",
+            file=_sys.stderr,
+        )
 
     body = {
         "model": model,

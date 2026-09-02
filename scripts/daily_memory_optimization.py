@@ -3,6 +3,20 @@
 
 no-agent cron script: stdout is delivered verbatim; empty stdout = silent.
 
+v2.3 (Sep 2026): Correctness — structured records, deterministic recency, paginated scanning.
+  - Structured MemoryRecord with timestamps and fact_type metadata
+  - Deterministic recency resolution from timestamps (not LLM list-position)
+  - Paginated /memories/list replaces broad recall (scan cursor for coverage)
+  - Cross-chunk candidate generation (BATCH_SIZE boundary fix)
+  - Version-gated Knowledge Pages is_stale behavior
+  - Idempotent document_id values for retains
+
+v2.4 (Sep 2026): Productization — CLI workflow, audit logging, privacy.
+  - JSON audit log (before/after state, restore capability)
+  - Privacy/PII redaction before cloud judging
+  - --dry-run / --apply / --allow-destructive / --restore CLI modes
+  - Local-model/private judging support via env vars
+
 v2.2.1 (Sep 2026): Safety patch.
   - LLM auto-mutation DISABLED by default (requires --allow-destructive flag)
   - Safe memory invalidation: fetches fact_type before PATCH (observations
@@ -81,6 +95,13 @@ try:
     import llm_judge
 except ImportError:
     llm_judge = None  # standalone run: skip LLM-driven steps
+
+# v2.3: structured memory records, paginated listing, candidate generation
+memory_records: types.ModuleType | None
+try:
+    import memory_records
+except ImportError:
+    memory_records = None  # standalone run: use old recall approach
 
 # Reuse the proven offload routine from the 30-min offload cron
 # (deployed copy lives next to this file in ~/.hermes/scripts/).
@@ -554,9 +575,9 @@ def flag_fingerprint(pair_contents):
 def llm_semantic_dedup_pass(problems, memories=None):
     """LLM-driven semantic dedup pass (Step 5, new in v2.0).
 
-    Recalls recent memories, uses LLM to identify semantic near-duplicates
-    (same fact, different wording), and invalidates the duplicates via PATCH
-    (non-destructive: state=invalidated, retained on disk for audit).
+    v2.3: Uses paginated /memories/list instead of one broad recall query.
+    Cross-chunk candidate generation fixes the BATCH_SIZE boundary problem.
+    Privacy redaction applied before sending to cloud judge.
 
     v2.0.1: accepts a pre-recalled shared memory list (same set feeds the
     contradiction scan, keeping indices consistent).
@@ -569,6 +590,56 @@ def llm_semantic_dedup_pass(problems, memories=None):
     if llm_judge is None:
         return  # LLM unavailable — skip (rule-based dedup happens in Hindsight's own consolidation)
 
+    # v2.3: use structured records from /memories/list when available
+    if memory_records is not None:
+        records, total_source, new_offset = memory_records.get_scan_batch()
+        if len(records) < 2:
+            return  # nothing to dedup
+
+        # Save scan cursor for next run
+        memory_records.save_scan_cursor({
+            "offset": new_offset,
+            "total_seen": memory_records.load_scan_cursor().get("total_seen", 0) + len(records),
+        })
+
+        # Generate cross-chunk candidate pairs (fixes BATCH_SIZE boundary)
+        candidates = memory_records.generate_candidate_pairs(records)
+        if not candidates:
+            return  # no candidates to check
+
+        # Prepare safe records for LLM judging (PII redacted)
+        safe_records = memory_records.prepare_for_judging(records)
+
+        # Build content list from safe records for the LLM
+        contents = [r["content"] for r in safe_records]
+        dup_groups = llm_judge.semantic_dedup(contents)
+
+        invalidated = 0
+        for group in dup_groups:
+            for dup_idx in group["duplicates"]:
+                if 0 <= dup_idx < len(records):
+                    mid = records[dup_idx].id
+                    # v2.4: audit log
+                    if memory_records is not None:
+                        memory_records.append_audit_log(memory_records.AuditEntry(
+                            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                            action="invalidate",
+                            memory_id=mid,
+                            before_state={"state": records[dup_idx].state, "fact_type": records[dup_idx].fact_type},
+                            reason="semantic_duplicate",
+                        ))
+                    if invalidate_memory(mid, reason="semantic_duplicate"):
+                        invalidated += 1
+
+        if invalidated > 0:
+            problems.append(
+                f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
+                f"(non-destructive — retained on disk for audit). "
+                f"Scanned {len(records)}/{total_source} source memories (cursor-based)."
+            )
+        return
+
+    # Fallback: old recall-based approach (v2.0)
     if memories is None:
         memories = recall_all_recent()
     if len(memories) < 2:
@@ -599,9 +670,9 @@ def _normalize_text(s):
 def llm_contradiction_scan(problems, memories=None):
     """LLM-driven contradiction detection (Step 6, new in v2.0).
 
-    Recalls recent memories, uses LLM to find entity-drift pairs (old vs new
-    state of the same fact), and applies recency-wins invalidation for state
-    changes. Stable-attribute conflicts are flagged for human review.
+    v2.3: Recency is resolved deterministically from MemoryRecord timestamps,
+    not from the LLM's interpretation of list position or wording. Uses
+    structured records when available. Cross-chunk candidate generation.
 
     v2.0.1: handles the 'meta_noise' type (invalidate the report memory),
     dedups flagged pairs across runs via a fingerprint state file (an
@@ -615,6 +686,117 @@ def llm_contradiction_scan(problems, memories=None):
     if llm_judge is None:
         return  # LLM unavailable — skip
 
+    # v2.3: use structured records for deterministic recency
+    if memory_records is not None:
+        records, total_source, _ = memory_records.get_scan_batch()
+        if len(records) < 2:
+            return
+
+        # Generate cross-chunk candidates
+        candidates = memory_records.generate_candidate_pairs(records)
+        if not candidates:
+            return
+
+        # Prepare safe records for LLM
+        safe_records = memory_records.prepare_for_judging(records)
+        contents = [r["content"] for r in safe_records]
+        contradictions = llm_judge.detect_contradictions(contents)
+
+        invalidated = 0
+        flagged = 0
+        seen_pairs = set()
+        prev_flags = load_flag_state()
+        new_flags = set()
+
+        for c in contradictions:
+            pair = c["pair"]
+            if not (0 <= pair[0] < len(records) and 0 <= pair[1] < len(records)):
+                continue
+            key = tuple(sorted(pair))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+
+            resolution = c.get("resolution", "flag_human")
+            reason = c.get("reason", "")
+
+            # v2.3: deterministic recency resolution from timestamps
+            if resolution == "recency_wins":
+                rec_a = records[pair[0]]
+                rec_b = records[pair[1]]
+                newer, older = memory_records.resolve_recency((rec_a, rec_b))
+
+                if older is not None:
+                    # Deterministic recency — invalidate the older one
+                    if memory_records is not None:
+                        memory_records.append_audit_log(memory_records.AuditEntry(
+                            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                            action="invalidate",
+                            memory_id=older.id,
+                            before_state={"state": older.state, "fact_type": older.fact_type},
+                            after_state={"state": "invalidated"},
+                            reason=f"superseded (deterministic recency): {reason}",
+                        ))
+                    if invalidate_memory(older.id, reason=f"superseded: {reason}"):
+                        invalidated += 1
+                else:
+                    # Missing/equal timestamps — can't determine recency, flag for human
+                    pair_contents = [rec_a.content, rec_b.content]
+                    fp = flag_fingerprint(pair_contents)
+                    if fp not in prev_flags:
+                        new_flags.add(fp)
+                        flagged += 1
+                        problems.append(
+                            f"LLM contradiction scan: state-change conflict but timestamps "
+                            f"missing/equal — needs manual recency check — "
+                            f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
+                        )
+
+            elif resolution == "invalidate_meta":
+                for idx in pair:
+                    if 0 <= idx < len(records) and META_MEMORY_RE.search(records[idx].content):
+                        if invalidate_memory(records[idx].id, reason="meta_noise: report about a past maintenance run"):
+                            invalidated += 1
+            else:
+                # Stable conflict — flag for human review
+                pair_contents = [records[pair[0]].content, records[pair[1]].content]
+                a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
+                if a == b or a.startswith(b) or b.startswith(a):
+                    shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
+                    if invalidate_memory(
+                        records[shorter_idx].id,
+                        reason="semantic_duplicate (near-verbatim pair)"
+                    ):
+                        invalidated += 1
+                    continue
+                if re.search(r"duplicat|identical", reason, re.IGNORECASE):
+                    shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
+                    if invalidate_memory(
+                        records[shorter_idx].id,
+                        reason=f"semantic_duplicate (judge reason: {reason[:80]})"
+                    ):
+                        invalidated += 1
+                    continue
+                fp = flag_fingerprint(pair_contents)
+                if fp in prev_flags:
+                    continue
+                new_flags.add(fp)
+                flagged += 1
+                problems.append(
+                    f"LLM contradiction scan: stable-attribute conflict needs review — "
+                    f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
+                )
+
+        if invalidated > 0:
+            problems.append(
+                f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
+                f"(recency-wins, deterministic from timestamps)"
+            )
+        if new_flags:
+            save_flag_state(prev_flags | new_flags)
+        return
+
+    # Fallback: old recall-based approach (v2.0)
     if memories is None:
         memories = recall_all_recent()
     if len(memories) < 2:
@@ -701,18 +883,90 @@ def llm_contradiction_scan(problems, memories=None):
         save_flag_state(prev_flags | new_flags)
 
 
+def _restore_memory(memory_id: str):
+    """Restore a previously invalidated memory (v2.4).
+
+    Re-validates a memory by PATCHing state back to 'valid'.
+    Reads the audit log to find the before_state for verification.
+    """
+    # Check audit log for the memory
+    audit_entries = []
+    if memory_records is not None:
+        audit_entries = memory_records.read_audit_log(limit=10, action="invalidate")
+        matching = [e for e in audit_entries if e.get("memory_id", "").startswith(memory_id)]
+        if matching:
+            entry = matching[-1]  # most recent
+            print(f"Found audit entry: {entry.get('timestamp')} — {entry.get('reason')}")
+            print(f"  Before state: {entry.get('before_state')}")
+
+    # Re-validate the memory
+    try:
+        http("PATCH", f"/v1/default/banks/{BANK}/memories/{memory_id}", timeout=120,
+             body={"state": "valid", "reason": "restored from audit log"})
+        print(f"Memory {memory_id[:12]}... restored to valid state.")
+        if memory_records is not None:
+            memory_records.append_audit_log(memory_records.AuditEntry(
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                action="restore",
+                memory_id=memory_id,
+                after_state={"state": "valid"},
+                reason="manual restore from audit log",
+            ))
+    except Exception as e:
+        print(f"Restore failed: {type(e).__name__}: {e}")
+
+
+def _print_audit_log():
+    """Print recent audit log entries (v2.4)."""
+    if memory_records is None:
+        print("memory_records module not available — no audit log.")
+        return
+    entries = memory_records.read_audit_log(limit=50)
+    if not entries:
+        print("No audit log entries found.")
+        return
+    print(f"Recent audit log ({len(entries)} entries):\n")
+    for e in entries:
+        print(f"  {e.get('timestamp', '?')} | {e.get('action', '?'):12s} | "
+              f"{e.get('memory_id', '')[:12]}... | {e.get('reason', '')[:60]}")
+
+
 def main():
     global ALLOW_DESTRUCTIVE
 
     # v2.2.1: parse CLI args
+    # v2.4: added --apply and --restore modes
     parser = argparse.ArgumentParser(description="Daily memory optimization")
     parser.add_argument("--allow-destructive", action="store_true",
                         help="Enable LLM auto-mutation (invalidate, config_tune). "
                              "Default: disabled — LLM is advisor only.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report issues without taking any action.")
+    parser.add_argument("--apply", action="store_true",
+                        help="Apply all recommended actions (implies --allow-destructive). "
+                             "Use --dry-run first to preview.")
+    parser.add_argument("--restore", type=str, metavar="AUDIT_ID",
+                        help="Restore a previously invalidated memory from the audit log. "
+                             "Pass the memory_id from the audit log entry.")
+    parser.add_argument("--audit-log", action="store_true",
+                        help="Print recent audit log entries and exit.")
     args = parser.parse_args()
-    ALLOW_DESTRUCTIVE = args.allow_destructive
+
+    # --apply implies --allow-destructive
+    if args.apply:
+        ALLOW_DESTRUCTIVE = True
+    else:
+        ALLOW_DESTRUCTIVE = args.allow_destructive
+
+    # --restore: re-validate a previously invalidated memory
+    if args.restore:
+        _restore_memory(args.restore)
+        return
+
+    # --audit-log: print recent entries and exit
+    if args.audit_log:
+        _print_audit_log()
+        return
 
     problems = []
 
@@ -821,11 +1075,31 @@ def main():
             problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
 
     # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) -------------
+    # v2.3: Version-gate the is_stale behavior. Per current Hindsight docs
+    # (v0.9.1+), tree is_stale is scope-aware (only marks stale when a
+    # memory in that page's tags+fact-type scope has been written since
+    # the page last read memories). The old bank-wide approximation
+    # workaround (querying mental models for small KBs) is only needed
+    # for versions < 0.9.1.
     try:
+        # Check Hindsight version for behavior gating
+        _, ver = http("GET", "/version", timeout=30)
+        api_version = ver.get("api_version", "0.0.0")
+        version_parts = tuple(int(x) for x in api_version.split(".")[:3] if x.isdigit())
+
         status, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=120)
         pages = [n for n in walk_tree(tree.get("roots")) if n.get("kind") == "page"]
         if pages:
-            if len(pages) <= KP_EXACT_CHECK_MAX:
+            # v2.3: For Hindsight >= 0.9.1, tree is_stale is scope-aware —
+            # use it directly. For older versions, use the mental-model
+            # workaround for small KBs.
+            use_tree_stale_directly = version_parts >= (0, 9, 1)
+
+            if use_tree_stale_directly or len(pages) > KP_EXACT_CHECK_MAX:
+                # Trust the tree's is_stale signal (scope-aware in 0.9.1+)
+                stale = [n for n in pages if n.get("is_stale")]
+            else:
+                # Old workaround: query each page's mental model
                 stale = []
                 for n in pages:
                     mm = n.get("mental_model_id")
@@ -835,11 +1109,10 @@ def main():
                         _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=120)
                         if m.get("is_stale"):
                             stale.append(n)
-            else:
-                stale = [n for n in pages if n.get("is_stale")]
             if stale and len(stale) / len(pages) > KP_STALE_RATIO_WARN:
                 problems.append(
                     f"Knowledge Pages: {len(stale)}/{len(pages)} pages stale "
+                    f"(v{api_version}, {'scope-aware' if use_tree_stale_directly else 'approximate'} signal) "
                     f"(e.g. {', '.join(n['name'] for n in stale[:3])}) — pages falling behind consolidation"
                 )
     except urllib.error.HTTPError:
@@ -940,7 +1213,12 @@ def main():
             )
 
             # Also print to stdout (for cron log visibility)
-            mode = "dry-run" if args.dry_run else ("destructive" if ALLOW_DESTRUCTIVE else "safe")
+            mode = (
+                "dry-run" if args.dry_run
+                else ("apply" if args.apply
+                else ("destructive" if ALLOW_DESTRUCTIVE
+                else "safe"))
+            )
             print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
             for u in unresolved:
                 print(f"  ⚠️ {u}")

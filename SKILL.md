@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 2.2.1
+version: 2.4.0
 author: Iris
 license: MIT
 trigger: >-
@@ -129,7 +129,7 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 - Daily memory optimization cron at 8:00 AM SGT (no-agent Python, `scripts/daily_memory_optimization.py` in this repo — deploy a copy to `~/.hermes/scripts/` next to `memory_offload.py`).
 - Hindsight health watchdog every 15min.
 
-### Daily cron behavior (v2.2.1, targets Hindsight 0.8+; LLM-driven dedup/contradiction; KP checks on 0.9+; LLM auto-resolve + Telegram; safety patch)
+### Daily cron behavior (v2.4.0, targets Hindsight 0.8+; structured records, paginated scanning, LLM-driven dedup/contradiction; KP checks on 0.9+; version-gated is_stale; LLM auto-resolve + Telegram; audit log + privacy redaction)
 1. `POST /consolidate` → poll operation to terminal state (max 8 min)
 2. Recall smoke-test after consolidation (over-prune check)
 3. **Retain smoke-test**: `success:true` AND `total_tokens > 0` — the exact step that silently fails while health stays green

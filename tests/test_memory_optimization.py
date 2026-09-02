@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 import daily_memory_optimization
 import llm_judge
 import memory_offload
+import memory_records
 
 # ============================================================================
 # LLM Judge: JSON parsing
@@ -732,3 +733,226 @@ class TestDestructiveFlag:
 
             assert len(resolved) == 1
             assert len(unresolved) == 0
+
+
+# ============================================================================
+# Memory Records: structured records, candidate generation, recency (v2.3)
+# ============================================================================
+
+class TestMemoryRecord:
+    def test_record_creation(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        mr = memory_records
+        rec = mr.MemoryRecord(
+            id="abc-123",
+            content="David prefers concise responses",
+            fact_type="world",
+            date="2026-09-02T10:00:00+00:00",
+        )
+        assert rec.fact_type == "world"
+        assert rec.is_curable is True
+        assert rec.is_observation is False
+
+    def test_record_timestamp_priority(self):
+        """timestamp should prefer occurred_start > date > edited_at."""
+        mr = memory_records
+        rec = mr.MemoryRecord(
+            id="abc",
+            content="test",
+            date="2026-09-02",
+            occurred_start="2026-08-01",
+        )
+        assert rec.timestamp == "2026-08-01"
+
+    def test_record_timestamp_fallback_to_date(self):
+        mr = memory_records
+        rec = mr.MemoryRecord(id="abc", content="test", date="2026-09-02")
+        assert rec.timestamp == "2026-09-02"
+
+    def test_record_timestamp_empty(self):
+        mr = memory_records
+        rec = mr.MemoryRecord(id="abc", content="test")
+        assert rec.timestamp == ""
+
+    def test_observation_not_curable(self):
+        mr = memory_records
+        rec = mr.MemoryRecord(id="abc", content="test", fact_type="observation")
+        assert rec.is_curable is False
+        assert rec.is_observation is True
+
+    def test_to_llm_dict_truncates_content(self):
+        mr = memory_records
+        long_content = "x" * 500
+        rec = mr.MemoryRecord(id="abcdef1234567890", content=long_content)
+        d = rec.to_llm_dict()
+        assert len(d["content"]) <= 200
+        assert len(d["id"]) <= 12
+
+
+class TestCrossChunkCandidates:
+    def test_adjacent_pairs_generated(self):
+        """Adjacent records should always be candidates (cross-chunk fix)."""
+        mr = memory_records
+        records = [
+            mr.MemoryRecord(id=f"r{i}", content=f"fact number {i}") for i in range(35)
+        ]
+        candidates = mr.generate_candidate_pairs(records)
+        # Adjacent pairs: (0,1), (1,2), ..., (33,34)
+        adjacent = [(i, i + 1) for i in range(34)]
+        for pair in adjacent:
+            assert pair in candidates, f"Adjacent pair {pair} missing from candidates"
+
+    def test_entity_overlap_generates_candidates(self):
+        """Records sharing entities should be candidates."""
+        mr = memory_records
+        records = [
+            mr.MemoryRecord(id="r0", content="Python is preferred", tags=["python"]),
+            mr.MemoryRecord(id="r1", content="Java is also used", tags=["java"]),
+            mr.MemoryRecord(id="r2", content="Python version updated", tags=["python"]),
+        ]
+        candidates = mr.generate_candidate_pairs(records)
+        # r0 and r2 share the "python" tag
+        assert (0, 2) in candidates
+
+    def test_no_candidates_with_no_overlap(self):
+        """Completely unrelated records should only have adjacent pairs."""
+        mr = memory_records
+        records = [
+            mr.MemoryRecord(id="r0", content="zzzzz unrelated"),
+            mr.MemoryRecord(id="r1", content="yyyyy different"),
+        ]
+        candidates = mr.generate_candidate_pairs(records)
+        # Only adjacent pair
+        assert (0, 1) in candidates
+
+
+class TestDeterministicRecency:
+    def test_recency_resolved_from_timestamps(self):
+        """Newer memory should be identified from timestamps."""
+        mr = memory_records
+        older = mr.MemoryRecord(id="old", content="old fact", date="2026-01-01")
+        newer = mr.MemoryRecord(id="new", content="new fact", date="2026-09-01")
+        result_newer, result_older = mr.resolve_recency((older, newer))
+        assert result_newer.id == "new"
+        assert result_older.id == "old"
+
+    def test_recency_missing_timestamps_returns_none(self):
+        """Missing timestamps should return (None, None) — flag for human."""
+        mr = memory_records
+        a = mr.MemoryRecord(id="a", content="fact a")
+        b = mr.MemoryRecord(id="b", content="fact b")
+        result_newer, result_older = mr.resolve_recency((a, b))
+        assert result_newer is None
+        assert result_older is None
+
+    def test_recency_equal_timestamps_returns_none(self):
+        """Equal timestamps should return (None, None) — ambiguous."""
+        mr = memory_records
+        a = mr.MemoryRecord(id="a", content="fact a", date="2026-09-01")
+        b = mr.MemoryRecord(id="b", content="fact b", date="2026-09-01")
+        result_newer, result_older = mr.resolve_recency((a, b))
+        assert result_newer is None
+        assert result_older is None
+
+    def test_recency_order_independent(self):
+        """Recency resolution should work regardless of pair order."""
+        mr = memory_records
+        older = mr.MemoryRecord(id="old", content="old", date="2026-01-01")
+        newer = mr.MemoryRecord(id="new", content="new", date="2026-09-01")
+        # Test both orders
+        n1, o1 = mr.resolve_recency((older, newer))
+        n2, o2 = mr.resolve_recency((newer, older))
+        assert n1.id == n2.id == "new"
+        assert o1.id == o2.id == "old"
+
+
+# ============================================================================
+# Privacy / PII redaction (v2.4)
+# ============================================================================
+
+class TestPIIRedaction:
+    def test_redact_email(self):
+        mr = memory_records
+        result = mr.redact_pii("contact me at [EMAIL]")
+        assert "[EMAIL]" not in result or result.count("[EMAIL]") == 1
+        assert "[EMAIL]" in mr.redact_pii("email: [EMAIL]")
+
+    def test_redact_api_key(self):
+        mr = memory_records
+        result = mr.redact_pii("the key is [API_KEY]")
+        assert "[API_KEY]" in result
+
+    def test_redact_ip(self):
+        mr = memory_records
+        result = mr.redact_pii("server at [IP]")
+        assert "[IP]" in result
+
+    def test_redact_multiple_types(self):
+        mr = memory_records
+        text = "Email: [EMAIL], IP: [IP], key: [API_KEY]"
+        result = mr.redact_pii(text)
+        assert "[EMAIL]" in result
+        assert "[IP]" in result
+        assert "[API_KEY]" in result
+
+    def test_should_exclude_credential_tag(self):
+        mr = memory_records
+        rec = mr.MemoryRecord(id="x", content="some content", tags=["secret"])
+        assert mr.should_exclude_from_judging(rec) is True
+
+    def test_should_exclude_credential_content(self):
+        mr = memory_records
+        rec = mr.MemoryRecord(id="x", content="the password = hunter2")
+        assert mr.should_exclude_from_judging(rec) is True
+
+    def test_should_not_exclude_mention(self):
+        mr = memory_records
+        rec = mr.MemoryRecord(id="x", content="passwords should be hashed")
+        assert mr.should_exclude_from_judging(rec) is False
+
+    def test_prepare_for_judging_excludes_sensitive(self):
+        mr = memory_records
+        records = [
+            mr.MemoryRecord(id="safe", content="safe content", tags=["env"]),
+            mr.MemoryRecord(id="secret", content="secret stuff", tags=["credential"]),
+        ]
+        safe = mr.prepare_for_judging(records)
+        assert len(safe) == 1
+        assert safe[0]["id"] == "safe"[:12]
+
+
+# ============================================================================
+# Audit log (v2.4)
+# ============================================================================
+
+class TestAuditLog:
+    def test_audit_entry_serialization(self):
+        mr = memory_records
+        entry = mr.AuditEntry(
+            timestamp="2026-09-02T10:00:00",
+            action="invalidate",
+            memory_id="abc-123",
+            reason="test reason",
+        )
+        jsonl = entry.to_jsonl()
+        parsed = json.loads(jsonl)
+        assert parsed["action"] == "invalidate"
+        assert parsed["memory_id"] == "abc-123"
+        assert parsed["reason"] == "test reason"
+
+    def test_audit_log_write_and_read(self):
+        mr = memory_records
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit_file = Path(tmpdir) / "audit.jsonl"
+            with patch.object(mr, "AUDIT_LOG_FILE", audit_file):
+                entry = mr.AuditEntry(
+                    timestamp="2026-09-02T10:00:00",
+                    action="invalidate",
+                    memory_id="test-123",
+                    reason="duplicate",
+                )
+                mr.append_audit_log(entry)
+                entries = mr.read_audit_log(limit=10)
+                assert len(entries) == 1
+                assert entries[0]["memory_id"] == "test-123"
+                assert entries[0]["action"] == "invalidate"
