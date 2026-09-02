@@ -25,21 +25,24 @@ jobs:
         run: pip install --only-binary ":all:" uv==0.5.4
 
       - name: Sync dependencies from lock file
-        run: uv sync --frozen --extra dev
+        run: uv sync --locked --no-install-project --extra dev --no-build
+
+      - name: Add venv to PATH
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Lint with ruff
-        run: uv run ruff check scripts/ tests/
+        run: ruff check scripts/ tests/
 
       - name: Type check with mypy
-        run: uv run mypy scripts/ --ignore-missing-imports || true
+        run: mypy scripts/ --ignore-missing-imports || true
 
       - name: Security scan with bandit
-        run: uv run bandit -r scripts/ -c pyproject.toml || true
+        run: bandit -r scripts/ -c pyproject.toml || true
 
       - name: Test with pytest
-        run: uv run pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short
 
       - name: Upload coverage
         if: matrix.python-version == '3.12'
-        run: uv run pytest tests/ --cov=scripts --cov-report=xml
+        run: pytest tests/ --cov=scripts --cov-report=xml
         # In a real repo, add: uses: codecov/codecov-action@v4
