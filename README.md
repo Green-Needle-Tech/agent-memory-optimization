@@ -42,7 +42,7 @@ Addresses critical data-loss, LLM action safety, and validation issues identifie
 | **P0** | Dedup canonical detection missed canonical==1 case | Fixed: entry is duplicate if `canonical==0 OR 0 in duplicates` |
 | **P0** | Observations return 400 on PATCH | `curate_memory()` fetches `fact_type` first; observations resolved via source memories |
 | **P0** | Telegram HTML not escaped | `html.escape()` on all dynamic content; delivery status reported accurately |
-| **P1** | Hardcoded `/root`, ports, limits | All paths/URLs/banks/caps configurable via environment variables |
+| **P1** | Hardcoded `/root`, ports, limits | All paths/URLs/banks/caps configurable via environment variables (`HERMES_HOME`, `WIKI_DIR`, `HINDSIGHT_URL`, etc.) |
 | **P1** | No file lock — cron race risk | `FileLock` (fcntl.flock) prevents concurrent offload + daily runs |
 | **P1** | `st_size` bytes mixed with char limits | Consistent decoded character counting |
 | **P2** | Tests covered helpers but not destructive workflows | 72 tests: offload safety (partial/all-fail/all-success), LLM validation (negatives, overlaps, self-pairs), safe invalidation (fact_type), HTML escaping, destructive flag |
@@ -165,6 +165,22 @@ cp agent-memory-optimization/scripts/*.py ~/.hermes/scripts/
 ```
 
 Requires a Hermes Agent instance. The L2 procedure targets a [Hindsight](https://hindsight.vectorize.io) (Vectorize.io) server; the L3 procedure targets a Karpathy-pattern LLM Wiki. Both layers are optional — the L1 procedure works standalone.
+
+### Environment variables
+
+All paths are dynamic — no hardcoded `/root`. The scripts resolve `~` via `os.path.expanduser` / `Path.home()`, so they work on any host (root, ubuntu, etc.).
+
+| Variable | Default | Description |
+|---|---|---|
+| `HERMES_HOME` | `~/.hermes` | Hermes config/data directory |
+| `WIKI_DIR` | `~/wiki` | Static LLM wiki directory (L3) |
+| `KB_DIR` | `$HERMES_HOME/kb` | SA-Copilot knowledge bundle (L3) |
+| `MEMORY_FILE` | `$HERMES_HOME/memories/MEMORY.md` | L1 memory file |
+| `USER_FILE` | `$HERMES_HOME/memories/USER.md` | L1 user profile file |
+| `HINDSIGHT_URL` | `http://localhost:8888` | Hindsight API endpoint (L2) |
+| `HINDSIGHT_BANK` | `main` | Hindsight bank name |
+| `MEMORY_CHARS` | `2200` | L1 MEMORY.md char cap |
+| `USER_CHARS` | `1375` | L1 USER.md char cap |
 
 **LLM-as-judge** (v2.1+): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `z-ai/glm-5.2` by default — an open-weight MIT-licensed model with a 1M context window. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks. The `llm_status` reported by `memory_offload.py` now accurately reflects whether the LLM endpoint is actually reachable (via `is_llm_available()`), not just whether the module imported.
 

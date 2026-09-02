@@ -32,7 +32,7 @@ Each maintenance run is independent. Always re-check current state (capacities, 
 ## Layer Topology
 - **L1 — Local memory** (`memory` tool): MEMORY.md (2,200 chars) + USER.md (1,375 chars). Always injected every turn.
 - **L2 — Hindsight** (localhost:8888, bank `main`): semantic recall on demand. Episodes, preferences, decisions.
-- **L3 — LLM Wiki / OKF bundle**: compiled knowledge. SA-Copilot bundle at `~/.hermes/kb` (git-versioned); older static wiki at `/root/wiki/`.
+- **L3 — LLM Wiki / OKF bundle**: compiled knowledge. SA-Copilot bundle at `~/.hermes/kb` (git-versioned); older static wiki at `~/wiki/` (or `$WIKI_DIR` if set).
 - **Division of labor:** L1 = "must know this turn" · L2 = "recall when relevant" · L3 = "compiled knowledge with sources". A fact existing in two layers lives in the deepest layer that surfaces it reliably — usually L2.
 
 ## L2 ↔ L3 Bridge: Hindsight and the Wiki (research, Aug 2026)
@@ -86,7 +86,7 @@ The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** fo
 ```
 memory(action="add", target="memory", content="probe")  # read usage % from error/usage (or read system prompt caps)
 curl -s http://localhost:8888/v1/default/banks/main/stats | jq '{nodes, failed_operations, pending_operations}'
-du -sh ~/.hermes/kb /root/wiki 2>/dev/null
+du -sh ~/.hermes/kb "${WIKI_DIR:-$HOME/wiki}" 2>/dev/null
 ```
 Report: L1 % for both stores, L2 node count + failed ops, L3 size.
 Red flags: node count climbing fast with flat recall quality (index pollution); failed_operations rising (silent write failures).

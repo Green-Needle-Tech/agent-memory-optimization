@@ -118,6 +118,7 @@ BANK = os.environ.get("HINDSIGHT_BANK", "main")
 MEM_FILE = Path(os.environ.get("MEMORY_FILE", str(HERMES_HOME / "memories" / "MEMORY.md")))
 USER_FILE = Path(os.environ.get("USER_FILE", str(HERMES_HOME / "memories" / "USER.md")))
 KB_DIR = Path(os.environ.get("KB_DIR", str(HERMES_HOME / "kb")))
+WIKI_DIR = Path(os.environ.get("WIKI_DIR", str(Path.home() / "wiki")))
 ENV_FILE = HERMES_HOME / ".env"
 
 POLL_INTERVAL = 10
@@ -1173,18 +1174,20 @@ def _check_knowledge_pages(problems):
 def _check_l3_wiki(problems):
     """Step 7b: L3 wiki lint-lite."""
     try:
-        if KB_DIR.exists():
-            md_files = [p for p in KB_DIR.rglob("*.md") if "_archive" not in p.parts]
-            stale = []
-            cutoff = time.time() - KB_STALE_DAYS * 86400
-            for p in md_files:
-                if p.stat().st_mtime < cutoff and "index.md" not in p.name.lower():
-                    stale.append(p.name)
-            if len(stale) >= 5:
-                problems.append(
-                    f"L3 wiki: {len(stale)} of {len(md_files)} pages older than {KB_STALE_DAYS} days "
-                    f"(e.g. {', '.join(sorted(stale)[:3])}) — run llm-wiki lint / refresh"
-                )
+        # Check both KB_DIR (~/.hermes/kb) and WIKI_DIR (~/wiki or $WIKI_DIR)
+        for wiki_dir in (KB_DIR, WIKI_DIR):
+            if wiki_dir.exists():
+                md_files = [p for p in wiki_dir.rglob("*.md") if "_archive" not in p.parts]
+                stale = []
+                cutoff = time.time() - KB_STALE_DAYS * 86400
+                for p in md_files:
+                    if p.stat().st_mtime < cutoff and "index.md" not in p.name.lower():
+                        stale.append(p.name)
+                if len(stale) >= 5:
+                    problems.append(
+                        f"L3 wiki ({wiki_dir}): {len(stale)} of {len(md_files)} pages older than {KB_STALE_DAYS} days "
+                        f"(e.g. {', '.join(sorted(stale)[:3])}) — run llm-wiki lint / refresh"
+                    )
     except Exception as e:
         problems.append(f"L3 wiki check failed: {type(e).__name__}: {e}")
 
