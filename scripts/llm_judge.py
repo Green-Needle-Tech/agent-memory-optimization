@@ -20,6 +20,15 @@ Design principles (grounded in 2026 agent-memory research):
     extraction): the LLM rates each entry's long-term retention value, acting
     as the write-time quality gate.
 
+v2.2.1 (Sep 2026): Strict LLM response validation.
+  - All indices validated: 0 <= i < n, no negative indices, no duplicates
+  - Canonical must not appear in its own duplicates list
+  - Duplicate groups must not overlap
+  - Contradiction pairs must have exactly 2 distinct indices in range
+  - newer_index must be one of the pair
+  - Missing/malformed entries default to KEEP LOCALLY (not offload)
+  - Invalid responses rejected entirely (no silent repair of destructive output)
+
 Usage:
   from llm_judge import classify_importance, semantic_dedup, detect_contradictions
 
@@ -36,12 +45,11 @@ Configuration:
 import json
 import os
 import re
-import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-# === Config ===
+# === Config (environment-overridable) ===
 DEFAULT_MODEL = os.environ.get("LLM_JUDGE_MODEL", "z-ai/glm-5.2")
 DEFAULT_BASE_URL = os.environ.get("LLM_JUDGE_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_MAX_TOKENS = 6000
@@ -51,6 +59,8 @@ BATCH_SIZE = 30  # max entries per LLM call — larger batches overflow the
                  # response token budget, the JSON truncates, parsing fails,
                  # and the caller silently degrades to rule-based fallback
                  # (observed live: 85-entry batch -> fallback flagged 30+ pairs)
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 
 
 def _chunk(items, size=BATCH_SIZE):
@@ -64,7 +74,7 @@ def _load_api_key():
     key = os.environ.get("LLM_JUDGE_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     if key:
         return key
-    env_file = Path("/root/.hermes/.env")
+    env_file = HERMES_HOME / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
@@ -137,6 +147,225 @@ def _parse_json_response(text):
             except json.JSONDecodeError:
                 continue
     return None
+
+
+# === Strict validation helpers (v2.2.1) ===
+
+def _validate_index(idx, n, context="index"):
+    """Validate a single index: must be int, 0 <= idx < n.
+
+    Negative indices are rejected explicitly — Python accepts them for list
+    access, but an LLM-hallucinated -1 targeting the last item is destructive.
+    """
+    if not isinstance(idx, int):
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            return None
+    if idx < 0 or idx >= n:
+        return None
+    return idx
+
+
+def _validate_indices_list(indices, n, context="indices"):
+    """Validate a list of indices. Returns cleaned list or None if any invalid.
+
+    All indices must be in range [0, n). No negative indices allowed.
+    """
+    result = []
+    for idx in indices:
+        validated = _validate_index(idx, n, context)
+        if validated is None:
+            return None
+        result.append(validated)
+    return result
+
+
+def _validate_dedup_group(group, n):
+    """Validate a single dedup group from LLM output.
+
+    Rules:
+    - canonical must be a valid index in [0, n)
+    - duplicates must all be valid indices in [0, n)
+    - canonical must NOT appear in duplicates (distinct)
+    - at least one duplicate required
+    - no duplicate index appears more than once
+
+    Returns cleaned group dict or None if invalid.
+    """
+    if not isinstance(group, dict):
+        return None
+    if "canonical" not in group or "duplicates" not in group:
+        return None
+
+    canonical = _validate_index(group["canonical"], n, "canonical")
+    if canonical is None:
+        return None
+
+    if not isinstance(group["duplicates"], list):
+        return None
+
+    dups = []
+    seen = {canonical}  # canonical must not appear in duplicates
+    for d in group["duplicates"]:
+        validated = _validate_index(d, n, "duplicate")
+        if validated is None:
+            return None
+        if validated in seen:
+            return None  # duplicate index in same group or == canonical
+        seen.add(validated)
+        dups.append(validated)
+
+    if not dups:
+        return None  # must have at least one duplicate
+
+    return {"canonical": canonical, "duplicates": dups}
+
+
+def _validate_dedup_groups(groups, n):
+    """Validate a list of dedup groups. Reject overlapping groups.
+
+    A duplicate index may appear in only one group. If any group is invalid,
+    the entire response is rejected — we do NOT silently repair destructive
+    output.
+    """
+    validated = []
+    used_indices = set()  # track all indices across groups
+
+    for g in groups:
+        clean = _validate_dedup_group(g, n)
+        if clean is None:
+            return None  # reject entire response on any invalid group
+        all_group_indices = {clean["canonical"]} | set(clean["duplicates"])
+        if all_group_indices & used_indices:
+            return None  # overlap between groups — reject
+        used_indices |= all_group_indices
+        validated.append(clean)
+
+    return validated
+
+
+def _validate_contradiction_pair(pair_data, n):
+    """Validate a single contradiction entry from LLM output.
+
+    Rules:
+    - pair must have exactly 2 elements
+    - both must be valid indices in [0, n)
+    - the two indices must be distinct (no self-pairs)
+    - newer_index (if present) must be one of the pair
+    - type must be one of the allowed values
+    - resolution must be one of the allowed values
+
+    Returns cleaned dict or None if invalid.
+    """
+    if not isinstance(pair_data, dict):
+        return None
+    if "pair" not in pair_data:
+        return None
+
+    raw_pair = pair_data["pair"]
+    if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+        return None
+
+    a = _validate_index(raw_pair[0], n, "pair[0]")
+    b = _validate_index(raw_pair[1], n, "pair[1]")
+    if a is None or b is None:
+        return None
+    if a == b:
+        return None  # self-pair — meaningless
+
+    c_type = pair_data.get("type", "unknown")
+    resolution = pair_data.get("resolution", "flag_human")
+
+    # Validate type and resolution are recognized values
+    valid_types = {"state_change", "stable_conflict", "meta_noise", "possible_drift", "unknown"}
+    valid_resolutions = {"recency_wins", "flag_human", "invalidate_meta"}
+    if c_type not in valid_types:
+        c_type = "unknown"
+    if resolution not in valid_resolutions:
+        resolution = "flag_human"  # safe default
+
+    newer_index = pair_data.get("newer_index")
+    if newer_index is not None:
+        newer_index = _validate_index(newer_index, n, "newer_index")
+        if newer_index is None or newer_index not in (a, b):
+            newer_index = None  # invalid — don't use, fall back to flag_human
+
+    # If recency_wins but no valid newer_index, downgrade to flag_human
+    if resolution == "recency_wins" and newer_index is None:
+        resolution = "flag_human"
+
+    return {
+        "pair": [a, b],
+        "type": c_type,
+        "resolution": resolution,
+        "reason": str(pair_data.get("reason", ""))[:200],  # cap reason length
+        "newer_index": newer_index,
+    }
+
+
+def _validate_contradictions(contradictions, n):
+    """Validate a list of contradiction entries. Deduplicate pairs.
+
+    Each unordered pair may appear at most once. If any entry is invalid,
+    the entire response is rejected.
+    """
+    validated = []
+    seen_pairs = set()
+
+    for c in contradictions:
+        clean = _validate_contradiction_pair(c, n)
+        if clean is None:
+            return None  # reject entire response
+        key = tuple(sorted(clean["pair"]))
+        if key in seen_pairs:
+            continue  # deduplicate — same pair reported twice
+        seen_pairs.add(key)
+        validated.append(clean)
+
+    return validated
+
+
+def _validate_classify_response(parsed, n_entries):
+    """Validate classify_importance LLM response.
+
+    Rules:
+    - essential and offloadable are lists of indices
+    - all indices in [0, n_entries)
+    - no overlap between essential and offloadable
+    - unclassified entries default to essential (keep locally — safe default)
+
+    Returns (essential, offloadable) or None if response is unparseable.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    if "essential" not in parsed or "offloadable" not in parsed:
+        return None
+
+    raw_essential = parsed.get("essential", [])
+    raw_offloadable = parsed.get("offloadable", [])
+
+    if not isinstance(raw_essential, list) or not isinstance(raw_offloadable, list):
+        return None
+
+    essential = _validate_indices_list(raw_essential, n_entries, "essential")
+    offloadable = _validate_indices_list(raw_offloadable, n_entries, "offloadable")
+
+    if essential is None or offloadable is None:
+        return None  # any invalid index → reject entirely
+
+    # Check for overlap
+    if set(essential) & set(offloadable):
+        return None  # overlap → reject
+
+    # Unclassified indices default to ESSENTIAL (keep locally — safe default)
+    all_indices = set(range(n_entries))
+    classified = set(essential) | set(offloadable)
+    unclassified = all_indices - classified
+    if unclassified:
+        essential.extend(sorted(unclassified))
+
+    return essential, offloadable
 
 
 # === Rule-based fallbacks (used when LLM unavailable) ===
@@ -218,6 +447,10 @@ def classify_importance(entries, context="L1 local memory for a Hermes AI agent"
     Uses LLM to rate each entry's long-term retention value (importance scoring,
     per Park et al. Generative Agents + Hindsight fact-extraction-as-filter).
 
+    v2.2.1: Strict validation — all indices validated, no overlap allowed,
+    unclassified entries default to ESSENTIAL (keep locally, safe default).
+    Invalid LLM responses cause fallback to rule-based for that chunk.
+
     Args:
         entries: list of memory entry strings
         context: description of the memory store for the LLM
@@ -225,13 +458,14 @@ def classify_importance(entries, context="L1 local memory for a Hermes AI agent"
     Returns:
         (essential_indices, offloadable_indices) — lists of integer indices
         into the input list. Falls back to rule-based prefix matching if LLM
-        is unavailable.
+        is unavailable or response is invalid.
     """
     if not entries:
         return [], []
 
     essential, offloadable = [], []
     for offset, chunk in _chunk(entries):
+        n_chunk = len(chunk)
         # Build a single batched prompt (LycheeMemory segment-level batching)
         numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
         prompt = (
@@ -248,21 +482,28 @@ def classify_importance(entries, context="L1 local memory for a Hermes AI agent"
         resp = _llm_chat([{"role": "user", "content": prompt}])
         parsed = _parse_json_response(resp)
 
-        if parsed and "essential" in parsed and "offloadable" in parsed:
-            essential.extend(int(i) for i in parsed["essential"] if isinstance(i, (int, float)) or str(i).isdigit())
-            offloadable.extend(int(i) for i in parsed["offloadable"] if isinstance(i, (int, float)) or str(i).isdigit())
+        # v2.2.1: strict validation of LLM response
+        validated = _validate_classify_response(parsed, n_chunk) if parsed else None
+
+        if validated is not None:
+            fe, fo = validated
+            essential.extend(offset + i for i in fe)
+            offloadable.extend(offset + i for i in fo)
         else:
             # Fallback for this chunk: rule-based
             fe, fo = _fallback_classify(chunk)
             essential.extend(offset + i for i in fe)
             offloadable.extend(offset + i for i in fo)
 
-    # Validate: all indices accounted for
+    # Final validation: all indices accounted for
     all_indices = set(range(len(entries)))
     classified = set(essential) | set(offloadable)
     unclassified = all_indices - classified
-    # Any unclassified go to offloadable (safe default)
-    offloadable.extend(unclassified)
+    # v2.2.1: unclassified go to ESSENTIAL (keep locally — safe default)
+    essential.extend(sorted(unclassified))
+    # Remove any overlap (shouldn't happen, but belt-and-suspenders)
+    offloadable_set = set(offloadable) - set(essential)
+    offloadable = sorted(offloadable_set)
     return essential, offloadable
 
 
@@ -274,18 +515,23 @@ def semantic_dedup(entries):
     primary language is Python") — these evade exact-match dedup but waste
     retrieval slots.
 
+    v2.2.1: Strict validation — indices bounds-checked, no negative indices,
+    canonical distinct from duplicates, no overlapping groups. Invalid
+    responses cause fallback to word-overlap for that chunk.
+
     Args:
         entries: list of memory entry strings
 
     Returns:
         List of duplicate groups: [{"canonical": idx, "duplicates": [idx, ...]}, ...]
-        Falls back to word-overlap dedup (>60%) if LLM unavailable.
+        Falls back to word-overlap dedup (>60%) if LLM unavailable or invalid.
     """
     if len(entries) < 2:
         return []
 
     groups = []
     for offset, chunk in _chunk(entries):
+        n_chunk = len(chunk)
         numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
         prompt = (
             f"You are a semantic deduplication judge for AI agent memory.\n"
@@ -305,12 +551,21 @@ def semantic_dedup(entries):
         parsed = _parse_json_response(resp)
 
         if parsed is not None and isinstance(parsed, list):
-            for g in parsed:
-                if isinstance(g, dict) and "canonical" in g and "duplicates" in g:
-                    canonical = int(g["canonical"])
-                    dups = [int(d) for d in g["duplicates"]]
-                    if dups:  # only include groups with at least one duplicate
-                        groups.append({"canonical": canonical, "duplicates": dups})
+            # v2.2.1: strict validation of all groups
+            validated = _validate_dedup_groups(parsed, n_chunk)
+            if validated is not None:
+                for g in validated:
+                    groups.append({
+                        "canonical": offset + g["canonical"],
+                        "duplicates": [offset + d for d in g["duplicates"]],
+                    })
+            else:
+                # Invalid response — fallback for this chunk
+                for g in _fallback_dedup(chunk):
+                    groups.append({
+                        "canonical": offset + g["canonical"],
+                        "duplicates": [offset + d for d in g["duplicates"]],
+                    })
         else:
             # Fallback for this chunk: word-overlap
             for g in _fallback_dedup(chunk):
@@ -330,6 +585,11 @@ def detect_contradictions(entries):
     - State changes → recency wins (invalidate old, keep new)
     - Stable attributes that conflict → flag for human review
 
+    v2.2.1: Strict validation — pairs must have exactly 2 distinct in-range
+    indices, newer_index must be one of the pair, type/resolution validated.
+    recency_wins without valid newer_index downgrades to flag_human.
+    Invalid responses cause fallback to keyword-based for that chunk.
+
     v2.0.1 prompt hardening (from live-run false positives):
     - Complementary pairs (policy vs capability, scope vs method) are NOT
       contradictions — only flag when both entries assert the same predicate
@@ -344,13 +604,14 @@ def detect_contradictions(entries):
 
     Returns:
         List of contradictions: [{"pair": [i, j], "type": str, "resolution": str, "reason": str}, ...]
-        Falls back to keyword-based drift detection if LLM unavailable.
+        Falls back to keyword-based drift detection if LLM unavailable or invalid.
     """
     if len(entries) < 2:
         return []
 
     contradictions = []
     for offset, chunk in _chunk(entries):
+        n_chunk = len(chunk)
         numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
         prompt = (
             f"You are a contradiction detector for AI agent memory.\n"
@@ -391,19 +652,20 @@ def detect_contradictions(entries):
         parsed = _parse_json_response(resp)
 
         if parsed is not None and isinstance(parsed, list):
-            for c in parsed:
-                if isinstance(c, dict) and "pair" in c:
-                    try:
-                        pair = [int(c["pair"][0]), int(c["pair"][1])]
-                    except (TypeError, ValueError, IndexError):
-                        continue
+            # v2.2.1: strict validation of all contradiction entries
+            validated = _validate_contradictions(parsed, n_chunk)
+            if validated is not None:
+                for c in validated:
                     contradictions.append({
-                        "pair": pair,
-                        "type": c.get("type", "unknown"),
-                        "resolution": c.get("resolution", "flag_human"),
-                        "reason": c.get("reason", ""),
-                        "newer_index": c.get("newer_index"),
+                        "pair": [offset + c["pair"][0], offset + c["pair"][1]],
+                        "type": c["type"],
+                        "resolution": c["resolution"],
+                        "reason": c["reason"],
+                        "newer_index": offset + c["newer_index"] if c["newer_index"] is not None else None,
                     })
+            else:
+                # Invalid response — fallback for this chunk
+                contradictions.extend(_fallback_contradictions(chunk))
         else:
             # Fallback for this chunk: keyword-based
             contradictions.extend(_fallback_contradictions(chunk))

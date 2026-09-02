@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 2.2.0
+version: 2.2.1
 author: Iris
 license: MIT
 trigger: >-
@@ -129,7 +129,7 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 - Daily memory optimization cron at 8:00 AM SGT (no-agent Python, `scripts/daily_memory_optimization.py` in this repo — deploy a copy to `~/.hermes/scripts/` next to `memory_offload.py`).
 - Hindsight health watchdog every 15min.
 
-### Daily cron behavior (v2.2.0, targets Hindsight 0.8+; LLM-driven dedup/contradiction; KP checks on 0.9+; LLM auto-resolve + Telegram)
+### Daily cron behavior (v2.2.1, targets Hindsight 0.8+; LLM-driven dedup/contradiction; KP checks on 0.9+; LLM auto-resolve + Telegram; safety patch)
 1. `POST /consolidate` → poll operation to terminal state (max 8 min)
 2. Recall smoke-test after consolidation (over-prune check)
 3. **Retain smoke-test**: `success:true` AND `total_tokens > 0` — the exact step that silently fails while health stays green
@@ -139,8 +139,8 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 7. **Knowledge Pages health** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages are stale — pages are projected views that inherit L2's failure modes. ⚠️ The tree's `is_stale` is a single bank-wide `last_memory_write_at` signal — on a bank that receives daily writes (including this script's own smoke-test retain) every page reads stale (false positive). For KBs ≤25 pages the script queries each page's mental model (`GET /mental-models/{id}`) for the exact per-page `is_stale`. 404 on older versions = skip silently
 8. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload (LLM-driven classification)
 9. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
-10. **LLM auto-resolve** (v2.2): if any issues were collected, attempt to resolve them with `z-ai/glm-5.2` (one LLM call) — consolidate, invalidate stale memories, or tune Hindsight config. LLM-optional — all issues remain unresolved if the LLM is unavailable.
-11. **Telegram notification** (v2.2): if any issues remain unresolved after the LLM attempt, send a DM to the user (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_HOME_CHANNEL` from `~/.hermes/.env`). Silent if all issues were resolved or no issues found.
+10. **LLM auto-resolve** (v2.2, updated v2.2.1): if any issues were collected, attempt to resolve them with `z-ai/glm-5.2` (one LLM call) — consolidate (always allowed), invalidate stale memories, or tune Hindsight config. **Destructive actions (invalidate, config_tune) are disabled by default** — pass `--allow-destructive` to enable. Config keys are allowlisted. LLM-optional — all issues remain unresolved if the LLM is unavailable.
+11. **Telegram notification** (v2.2, updated v2.2.1): if any issues remain unresolved after the LLM attempt, send a DM to the user (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_HOME_CHANNEL` from `~/.hermes/.env`). HTML content is escaped. Delivery status is reported accurately. Silent if all issues were resolved or no issues found.
 
 Silent on success (empty stdout); exit 0 always — errors surface via stdout, never via nonzero exit.
 

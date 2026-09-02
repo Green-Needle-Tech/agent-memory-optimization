@@ -3,11 +3,22 @@
 
 no-agent cron script: stdout is delivered verbatim; empty stdout = silent.
 
-v2.0 (Aug 2026): LLM-driven semantic dedup + contradiction detection.
-  - L2 semantic dedup pass via llm_judge.semantic_dedup() (replaces manual recall+overlap)
-  - L2 contradiction scan via llm_judge.detect_contradictions() (replaces manual scan)
-  - LLM-optional: degrades to rule-based if LLM unavailable
-  - Batch consolidation: all memories in one LLM call (LycheeMemory V2 pattern)
+v2.2.1 (Sep 2026): Safety patch.
+  - LLM auto-mutation DISABLED by default (requires --allow-destructive flag)
+  - Safe memory invalidation: fetches fact_type before PATCH (observations
+    return 400 — now handled by finding and invalidating source memories)
+  - Telegram HTML content escaped (raw <, >, & caused delivery failure)
+  - Telegram delivery status reported accurately (was always "sent")
+  - Config via environment variables (no hardcoded /root paths)
+  - Character-count consistency (decoded chars, not st_size bytes)
+  - Atomic state-file writes
+
+v2.2 (Sep 2026): LLM auto-resolve + Telegram notification.
+  - After collecting issues, the script attempts to resolve them using
+    z-ai/glm-5.2 (one LLM call): consolidate, invalidate stale memories,
+    or tune Hindsight config
+  - Issues the LLM cannot auto-resolve are sent as a Telegram DM notification
+  - Silent if all issues are resolved by the LLM or no issues found
 
 v2.0.1 (Aug 2026): self-pollution fixes from live-run false positives.
   - Smoke-test probe memories are tagged and retired after 48h (30 had accumulated)
@@ -21,12 +32,11 @@ v2.0.1 (Aug 2026): self-pollution fixes from live-run false positives.
   - Stable-conflict flags deduped across runs via fingerprint state file
     (an unresolved flag reports once, not daily)
 
-v2.2 (Sep 2026): LLM auto-resolve + Telegram notification.
-  - After collecting issues, the script attempts to resolve them using
-    z-ai/glm-5.2 (one LLM call): consolidate, invalidate stale memories,
-    or tune Hindsight config
-  - Issues the LLM cannot auto-resolve are sent as a Telegram DM notification
-  - Silent if all issues are resolved by the LLM or no issues found
+v2.0 (Aug 2026): LLM-driven semantic dedup + contradiction detection.
+  - L2 semantic dedup pass via llm_judge.semantic_dedup() (replaces manual recall+overlap)
+  - L2 contradiction scan via llm_judge.detect_contradictions() (replaces manual scan)
+  - LLM-optional: degrades to rule-based if LLM unavailable
+  - Batch consolidation: all memories in one LLM call (LycheeMemory V2 pattern)
 
 Behavior (per memory-optimization skill v2.0.0):
   L2 (Hindsight, any 0.8+; Knowledge Pages checks activate on 0.9+):
@@ -49,12 +59,15 @@ Output only when something needs attention; else silent. Exit 0 always
 (a crash is reported via stdout, never via nonzero exit).
 """
 
+import argparse
 import contextlib
 import hashlib
+import html
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import types
 import urllib.error
@@ -77,24 +90,33 @@ try:
 except ImportError:
     memory_offload = None  # standalone run: offload step will be skipped
 
-BASE = "http://localhost:8888"
-BANK = "main"
+# === Config (environment-overridable, no hardcoded /root) ===
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+BASE = os.environ.get("HINDSIGHT_URL", "http://localhost:8888")
+BANK = os.environ.get("HINDSIGHT_BANK", "main")
+MEM_FILE = Path(os.environ.get("MEMORY_FILE", str(HERMES_HOME / "memories" / "MEMORY.md")))
+USER_FILE = Path(os.environ.get("USER_FILE", str(HERMES_HOME / "memories" / "USER.md")))
+KB_DIR = Path(os.environ.get("KB_DIR", str(HERMES_HOME / "kb")))
+ENV_FILE = HERMES_HOME / ".env"
+
 POLL_INTERVAL = 10
 POLL_DEADLINE = 480          # 8 min max wait for consolidation
-MEM_CAP = 2200
-USER_CAP = 1375
+MEM_CAP = int(os.environ.get("MEMORY_CHARS", "2200"))
+USER_CAP = int(os.environ.get("USER_CHARS", "1375"))
 MEM_WARN = 0.90              # warn at 90% capacity
 OFFLOAD_AT = 0.90            # trigger Hindsight offload at >=90%
-KB_DIR = Path("/root/.hermes/kb")
 KB_STALE_DAYS = 90           # L3 page staleness threshold (skill: >90 days = stale)
 FAILED_OPS_WARN = 10         # failed_operations count worth reporting
 KP_STALE_RATIO_WARN = 0.5    # warn when >50% of knowledge pages are stale
 KP_EXACT_CHECK_MAX = 25      # use exact per-page mental-model is_stale for KBs up to this size
-STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_state.json")
+STATE_FILE = HERMES_HOME / "scripts" / ".daily_memory_opt_state.json"
 
 # LLM-driven dedup/contradiction settings
 DEDUP_RECALL_LIMIT = 50      # max memories to recall for LLM dedup/contradiction scan
 DEDUP_RECALL_TOKENS = 3000   # token budget for recall query
+
+# v2.2.1: LLM auto-mutation disabled by default — requires --allow-destructive
+ALLOW_DESTRUCTIVE = False
 
 # v2.0.1: self-pollution guards
 SMOKE_TEST_TAG = "daily-memopt-smoke"   # tag on the retain smoke-test memory
@@ -110,10 +132,9 @@ META_MEMORY_PATTERNS = [                # reports ABOUT past maintenance runs = 
     r"flagged for (?:human )?review",
 ]
 META_MEMORY_RE = re.compile("|".join(META_MEMORY_PATTERNS), re.IGNORECASE)
-FLAG_STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_flags.json")
+FLAG_STATE_FILE = HERMES_HOME / "scripts" / ".daily_memory_opt_flags.json"
 
 # Telegram notification config (for unresolved issues)
-ENV_FILE = Path("/root/.hermes/.env")
 TG_MAX_MSG_LEN = 4000   # Telegram message limit is 4096; keep margin
 
 
@@ -132,16 +153,112 @@ def _read_env_var(var_name):
     return ""
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write content to path atomically via temp file + os.replace()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _escape_html(text: str) -> str:
+    """Escape HTML special characters for Telegram parse_mode=HTML.
+
+    v2.2.1: Raw <, >, & in issue text caused Telegram delivery failure
+    or malformed output. html.escape handles all three + quotes.
+    """
+    return html.escape(text, quote=False)
+
+
+# === Safe memory invalidation (v2.2.1) ===
+
+def _get_memory(mid):
+    """Fetch a single memory by ID. Returns dict or None."""
+    try:
+        _, resp = http("GET", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=120)
+        return resp
+    except Exception:
+        return None
+
+
+def curate_memory(memory_id, action="invalidate", reason=""):
+    """Safe memory curation: invalidates a memory after checking fact_type.
+
+    v2.2.1: Only world and experience memories can be directly invalidated.
+    Observations are derived — PATCH returns 400. For observations, we
+    find and invalidate their source memories instead.
+
+    Returns True if the memory (or its sources) were invalidated, False otherwise.
+    """
+    mem = _get_memory(memory_id)
+    if mem is None:
+        return False
+
+    fact_type = mem.get("fact_type", "world")
+
+    if fact_type in ("world", "experience"):
+        # Source fact — safe to invalidate directly
+        return _patch_invalidate(memory_id, reason)
+
+    if fact_type == "observation":
+        # Derived fact — can't PATCH directly. Find and invalidate sources.
+        source_ids = mem.get("source_memory_ids", [])
+        if not source_ids:
+            # No source IDs available — can't safely invalidate
+            return False
+        invalidated_any = False
+        for sid in source_ids:
+            if _patch_invalidate(sid, reason):
+                invalidated_any = True
+        return invalidated_any
+
+    # Unknown fact type — don't touch it
+    return False
+
+
+def _patch_invalidate(mid, reason=""):
+    """Direct PATCH invalidation (world/experience only)."""
+    try:
+        http("PATCH", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=120,
+             body={"state": "invalidated", "reason": reason})
+        return True
+    except Exception:
+        return False
+
+
+def invalidate_memory(mid, reason="duplicate"):
+    """Non-destructive invalidation with fact_type safety check.
+
+    v2.2.1: Wraps curate_memory() to add fact_type checking. Observations
+    are handled by invalidating their source memories. Never DELETE —
+    invalidation preserves audit trail and is recoverable.
+    """
+    return curate_memory(mid, action="invalidate", reason=reason)
+
+
 def try_resolve_issues_with_llm(problems):
     """Attempt to resolve collected issues using z-ai/glm-5.2 (one try).
 
+    v2.2.1: LLM auto-mutation is DISABLED by default. The LLM is used as
+    an ADVISOR only — it proposes actions, but destructive actions
+    (invalidate, config_tune) are only executed if ALLOW_DESTRUCTIVE is True.
+    Consolidation (non-destructive) is always allowed.
+
     Sends the issue list to the LLM with context about the memory system
     and available Hindsight API operations. The LLM returns a JSON action
-    plan; each action is executed (invalidate stale memory, consolidate,
-    etc.). Returns (resolved_issues, unresolved_issues) lists.
+    plan; each action is validated against a typed policy before execution.
 
-    If llm_judge is unavailable or the LLM call fails, all issues remain
-    unresolved.
+    Returns (resolved_issues, unresolved_issues) lists.
     """
     if llm_judge is None:
         return [], list(problems)
@@ -149,7 +266,7 @@ def try_resolve_issues_with_llm(problems):
     system_prompt = (
         "You are a memory maintenance resolver for a three-layer AI agent memory system.\n"
         "L1 = local MEMORY.md/USER.md (always injected, char-capped).\n"
-        "L2 = Hindsight server at localhost:8888 (semantic recall, consolidation, Knowledge Pages).\n"
+        "L2 = Hindsight server (semantic recall, consolidation, Knowledge Pages).\n"
         "L3 = LLM Wiki (git-versioned markdown knowledge base).\n\n"
         "You receive a list of issues found during daily maintenance.\n"
         "For each issue, decide if it can be auto-resolved with an API action.\n"
@@ -186,13 +303,22 @@ def try_resolve_issues_with_llm(problems):
 
         resolved, unresolved = [], []
 
+        # Allowlisted config keys (v2.2.1: prevent arbitrary config mutation)
+        ALLOWED_CONFIG_KEYS = {
+            "recall_budget_function", "recall_max_tokens",
+            "consolidation_max_memories_per_round",
+            "retain_mission", "reflect_mission",
+            "enable_auto_consolidation",
+        }
+
         for item in plan:
             idx = item.get("issue_index", -1)
-            if idx < 0 or idx >= len(problems):
+            if not isinstance(idx, int) or idx < 0 or idx >= len(problems):
                 continue
             issue = problems[idx]
             action = item.get("action", "skip")
 
+            # Consolidate is always safe (non-destructive)
             if action == "consolidate":
                 try:
                     http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
@@ -200,7 +326,8 @@ def try_resolve_issues_with_llm(problems):
                 except Exception:
                     unresolved.append(issue)
 
-            elif action == "invalidate":
+            # Destructive actions require --allow-destructive flag (v2.2.1)
+            elif action == "invalidate" and ALLOW_DESTRUCTIVE:
                 query = item.get("query", "")
                 reason = item.get("reason", "stale memory invalidated by LLM resolver")
                 if query:
@@ -216,10 +343,11 @@ def try_resolve_issues_with_llm(problems):
                 else:
                     unresolved.append(issue)
 
-            elif action == "config_tune":
+            elif action == "config_tune" and ALLOW_DESTRUCTIVE:
                 key = item.get("key", "")
                 value = item.get("value", "")
-                if key:
+                # v2.2.1: allowlist config keys
+                if key and key in ALLOWED_CONFIG_KEYS:
                     try:
                         http("PATCH", f"/v1/default/banks/{BANK}/config", timeout=120,
                              body={"updates": {key: value}})
@@ -229,7 +357,8 @@ def try_resolve_issues_with_llm(problems):
                 else:
                     unresolved.append(issue)
 
-            else:  # skip or unknown
+            else:
+                # skip, unknown, or destructive action without --allow-destructive
                 unresolved.append(issue)
 
         return resolved, unresolved
@@ -243,13 +372,19 @@ def send_telegram_notification(text):
 
     Reads TELEGRAM_BOT_TOKEN and TELEGRAM_HOME_CHANNEL from ~/.hermes/.env.
     Returns True on success, False on failure (silent — never crash the cron).
+
+    v2.2.1: HTML content is now escaped (raw <, >, & caused delivery failure
+    or malformed output). The caller now checks the return value to report
+    delivery status accurately.
     """
     bot_token = _read_env_var("TELEGRAM_BOT_TOKEN")
     chat_id = _read_env_var("TELEGRAM_HOME_CHANNEL")
     if not bot_token or not chat_id:
         return False
 
-    # Truncate to Telegram limit
+    # v2.2.1: escape HTML special characters in issue text
+    # Keep our own <b>, <i>, <br/> tags — escape only the dynamic content
+    # The caller is responsible for using escaped text in the body.
     if len(text) > TG_MAX_MSG_LEN:
         text = text[:TG_MAX_MSG_LEN - 20] + "\n\n…(truncated)"
 
@@ -310,19 +445,6 @@ def recall_recent_memories(query="user preferences, environment, configuration, 
         return memories[:(limit or DEDUP_RECALL_LIMIT)]
     except Exception:
         return []
-
-
-def invalidate_memory(mid, reason="duplicate"):
-    """Non-destructive invalidation: PATCH state=invalidated (recall-hidden, retained on disk).
-
-    Never DELETE — invalidation preserves audit trail and is recoverable.
-    """
-    try:
-        http("PATCH", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=120,
-             body={"state": "invalidated", "reason": reason})
-        return True
-    except Exception:
-        return False
 
 
 def recall_all_recent(limit=DEDUP_RECALL_LIMIT):
@@ -420,7 +542,7 @@ def load_flag_state():
 def save_flag_state(flags):
     """Persist stable-conflict fingerprints so unresolved flags report once, not daily."""
     with contextlib.suppress(Exception):
-        FLAG_STATE_FILE.write_text(json.dumps(sorted(flags)))
+        _atomic_write_text(FLAG_STATE_FILE, json.dumps(sorted(flags)))
 
 
 def flag_fingerprint(pair_contents):
@@ -458,7 +580,7 @@ def llm_semantic_dedup_pass(problems, memories=None):
     invalidated = 0
     for group in dup_groups:
         for dup_idx in group["duplicates"]:
-            if dup_idx < len(memories):
+            if 0 <= dup_idx < len(memories):
                 mid = memories[dup_idx]["id"]
                 if invalidate_memory(mid, reason="semantic_duplicate"):
                     invalidated += 1
@@ -509,6 +631,9 @@ def llm_contradiction_scan(problems, memories=None):
 
     for c in contradictions:
         pair = c["pair"]
+        # v2.2.1: indices already validated by llm_judge, but double-check bounds
+        if not (0 <= pair[0] < len(memories) and 0 <= pair[1] < len(memories)):
+            continue
         # Normalize unordered pair; skip if already handled this run
         key = tuple(sorted(pair))
         if key in seen_pairs:
@@ -522,14 +647,14 @@ def llm_contradiction_scan(problems, memories=None):
         if resolution == "recency_wins" and newer_idx is not None:
             # Invalidate the OLDER entry (the one that's NOT newer_idx)
             older_idx = pair[0] if pair[1] == newer_idx else pair[1]
-            if older_idx < len(memories):
+            if 0 <= older_idx < len(memories):
                 mid = memories[older_idx]["id"]
                 if invalidate_memory(mid, reason=f"superseded: {reason}"):
                     invalidated += 1
         elif resolution == "invalidate_meta":
             # The entry itself is a report about a past run — invalidate it
             for idx in pair:
-                if idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]) and invalidate_memory(
+                if 0 <= idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]) and invalidate_memory(
                     memories[idx]["id"], reason="meta_noise: report about a past maintenance run"
                 ):
                     invalidated += 1
@@ -550,7 +675,10 @@ def llm_contradiction_scan(problems, memories=None):
             # over the type label and resolve as dedup.
             if re.search(r"duplicat|identical", reason, re.IGNORECASE):
                 shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
-                if invalidate_memory(memories[shorter_idx]["id"], reason=f"semantic_duplicate (judge reason: {reason[:80]})"):
+                if invalidate_memory(
+                    memories[shorter_idx]["id"],
+                    reason=f"semantic_duplicate (judge reason: {reason[:80]})"
+                ):
                     invalidated += 1
                 continue
             # Cross-run dedup: only report pairs not already flagged before.
@@ -574,17 +702,32 @@ def llm_contradiction_scan(problems, memories=None):
 
 
 def main():
+    global ALLOW_DESTRUCTIVE
+
+    # v2.2.1: parse CLI args
+    parser = argparse.ArgumentParser(description="Daily memory optimization")
+    parser.add_argument("--allow-destructive", action="store_true",
+                        help="Enable LLM auto-mutation (invalidate, config_tune). "
+                             "Default: disabled — LLM is advisor only.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Report issues without taking any action.")
+    args = parser.parse_args()
+    ALLOW_DESTRUCTIVE = args.allow_destructive
+
     problems = []
 
     # --- 1. Trigger consolidation -------------------------------------
     op_id = None
-    try:
-        status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
-        op_id = resp.get("operation_id")
-        if not op_id:
-            problems.append(f"Consolidate returned HTTP {status} but no operation_id: {str(resp)[:120]}")
-    except Exception as e:
-        problems.append(f"Consolidate trigger failed: {type(e).__name__}: {e}")
+    if not args.dry_run:
+        try:
+            status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
+            op_id = resp.get("operation_id")
+            if not op_id:
+                problems.append(f"Consolidate returned HTTP {status} but no operation_id: {str(resp)[:120]}")
+        except Exception as e:
+            problems.append(f"Consolidate trigger failed: {type(e).__name__}: {e}")
+    else:
+        problems.append("[dry-run] Consolidation skipped")
 
     # --- 2. Poll operation until terminal state ------------------------
     final = None
@@ -607,35 +750,37 @@ def main():
             problems.append(f"Consolidation op {op_id[:8]} ended with status={final.get('status')}")
 
     # --- 3. Recall smoke-test (consolidation over-prune check) ----------
-    # Health green != writes/recall working; probe a known-durable fact.
     if final is not None and final.get("status") == "completed":
         try:
             _, rec = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=120,
                           body={"query": "David's preferred output language and document summary style"})
             hits = rec.get("results") or rec.get("memories") or rec.get("items") or []
             if not hits:
-                problems.append("Recall smoke-test returned 0 results after consolidation — possible over-prune; verify manually")
+                problems.append(
+                    "Recall smoke-test returned 0 results after consolidation — "
+                    "possible over-prune; verify manually"
+                )
         except Exception as e:
             problems.append(f"Recall smoke-test failed: {type(e).__name__}: {e}")
 
     # --- 3b. Retain smoke-test (silent write-failure check) -------------
-    # success:true with total_tokens == 0 means fact extraction did NOT run
-    # (the exact step that fails on broken auth / bad LLM while health is green).
-    # v2.0.1: the probe memory is tagged so cleanup_smoke_tests can retire it
-    # once stale — untagged probes accumulated 30+ in the bank.
-    try:
-        _, ret = http("POST", f"/v1/default/banks/{BANK}/memories", timeout=120,
-                      body={"items": [{
-                          "content": f"daily memory optimization smoke test {time.strftime('%Y-%m-%d')}",
-                          "tags": [SMOKE_TEST_TAG],
-                      }]})
-        usage = (ret.get("usage") or {})
-        if not ret.get("success"):
-            problems.append(f"Retain smoke-test failed: success != true ({str(ret)[:120]})")
-        elif not usage.get("total_tokens"):
-            problems.append("Retain smoke-test: success but total_tokens=0 — fact extraction not running; check LLM provider/auth")
-    except Exception as e:
-        problems.append(f"Retain smoke-test failed: {type(e).__name__}: {e}")
+    if not args.dry_run:
+        try:
+            _, ret = http("POST", f"/v1/default/banks/{BANK}/memories", timeout=120,
+                          body={"items": [{
+                              "content": f"daily memory optimization smoke test {time.strftime('%Y-%m-%d')}",
+                              "tags": [SMOKE_TEST_TAG],
+                          }]})
+            usage = (ret.get("usage") or {})
+            if not ret.get("success"):
+                problems.append(f"Retain smoke-test failed: success != true ({str(ret)[:120]})")
+            elif not usage.get("total_tokens"):
+                problems.append(
+                    "Retain smoke-test: success but total_tokens=0 — "
+                    "fact extraction not running; check LLM provider/auth"
+                )
+        except Exception as e:
+            problems.append(f"Retain smoke-test failed: {type(e).__name__}: {e}")
 
     # --- 4. Bank stats + failed_operations trend -----------------------
     try:
@@ -644,46 +789,38 @@ def main():
         docs = stats.get("total_documents", 0)
         if nodes <= 0:
             problems.append(f"Bank '{BANK}' stats suspicious: total_nodes={nodes}, docs={docs}")
-        # failed_operations climbing = silent write failures despite green health
         failed = stats.get("failed_operations", 0)
         prev_failed = 0
         if STATE_FILE.exists():
             with contextlib.suppress(Exception):
                 prev_failed = int(json.loads(STATE_FILE.read_text()).get("failed_operations", 0))
         if failed >= FAILED_OPS_WARN or failed > prev_failed:
-            problems.append(f"failed_operations={failed} (was {prev_failed}) — Hindsight writes failing silently; check backlog")
-        STATE_FILE.write_text(json.dumps({"failed_operations": failed}))
+            problems.append(
+                f"failed_operations={failed} (was {prev_failed}) — "
+                f"Hindsight writes failing silently; check backlog"
+            )
+        _atomic_write_text(STATE_FILE, json.dumps({"failed_operations": failed}))
     except Exception as e:
         problems.append(f"Bank stats fetch failed: {type(e).__name__}: {e}")
 
     # --- 5. LLM dedup + contradiction passes (v2.0, restructured v2.0.1) -
-    # One shared recall feeds both passes (consistent indices), after:
-    #   a. smoke-test cleanup (old probes invalidated)
-    #   b. meta-memory invalidation (reports about past runs = noise)
-    #   c. exact-duplicate pre-pass (no LLM needed for verbatim copies)
-    try:
-        cleanup_smoke_tests(problems)
-        memories = recall_all_recent()
-        if memories:
-            invalidate_meta_memories(memories, problems)
-            exact_dupes = exact_duplicate_prepass(memories)
-            if exact_dupes:
-                problems.append(f"Exact-duplicate pre-pass: {exact_dupes} verbatim copies invalidated")
-            # Drop memories invalidated by the pre-passes before the LLM sees them
-            memories = [m for m in memories if not META_MEMORY_RE.search(m["content"])]
-        llm_semantic_dedup_pass(problems, memories=memories)
-        llm_contradiction_scan(problems, memories=memories)
-    except Exception as e:
-        problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
+    if not args.dry_run:
+        try:
+            cleanup_smoke_tests(problems)
+            memories = recall_all_recent()
+            if memories:
+                invalidate_meta_memories(memories, problems)
+                exact_dupes = exact_duplicate_prepass(memories)
+                if exact_dupes:
+                    problems.append(f"Exact-duplicate pre-pass: {exact_dupes} verbatim copies invalidated")
+                # Drop memories invalidated by the pre-passes before the LLM sees them
+                memories = [m for m in memories if not META_MEMORY_RE.search(m["content"])]
+            llm_semantic_dedup_pass(problems, memories=memories)
+            llm_contradiction_scan(problems, memories=memories)
+        except Exception as e:
+            problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
 
     # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) -------------
-    # A page is a projected view over memory — it inherits L2's failure
-    # modes. The tree's is_stale comes from a single bank-wide
-    # last_memory_write_at signal, so on a bank that receives daily writes
-    # (incl. this script's own smoke-test retain) EVERY page looks stale —
-    # a false positive. For small KBs (<= KP_EXACT_CHECK_MAX pages) query
-    # each page's mental model for the exact per-page is_stale instead.
-    # 404 = older version or feature off: skip.
     try:
         status, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=120)
         pages = [n for n in walk_tree(tree.get("roots")) if n.get("kind") == "page"]
@@ -717,7 +854,6 @@ def main():
             stale = []
             cutoff = time.time() - KB_STALE_DAYS * 86400
             for p in md_files:
-                # skip index pages; flag pages whose mtime is old
                 if p.stat().st_mtime < cutoff and "index.md" not in p.name.lower():
                     stale.append(p.name)
             if len(stale) >= 5:
@@ -725,26 +861,23 @@ def main():
                     f"L3 wiki: {len(stale)} of {len(md_files)} pages older than {KB_STALE_DAYS} days "
                     f"(e.g. {', '.join(sorted(stale)[:3])}) — run llm-wiki lint / refresh"
                 )
-        elif not Path("/root/wiki").exists():
-            pass  # no L3 bundle installed — not an error
     except Exception as e:
         problems.append(f"L3 wiki check failed: {type(e).__name__}: {e}")
 
     # --- 8. Local memory capacity check --------------------------------
+    # v2.2.1: use decoded char count, not st_size bytes
     try:
-        mem = Path("/root/.hermes/memories/MEMORY.md")
-        usr = Path("/root/.hermes/memories/USER.md")
-        if mem.exists():
-            n = mem.stat().st_size
+        if MEM_FILE.exists():
+            content = MEM_FILE.read_text(encoding="utf-8")
+            n = len(content)
             pct = n / MEM_CAP
             if pct >= OFFLOAD_AT:
-                # Memory nearly full — run Hindsight offload to reclaim space.
                 if memory_offload is None:
                     problems.append(
                         f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
                         "memory_offload.py not found next to this script; offload skipped"
                     )
-                else:
+                elif not args.dry_run:
                     try:
                         used_before, _ = memory_offload.get_memory_usage()
                         memory_offload.main()
@@ -766,8 +899,9 @@ def main():
                         )
             elif pct >= MEM_WARN:
                 problems.append(f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — approaching capacity")
-        if usr.exists():
-            n = usr.stat().st_size
+        if USER_FILE.exists():
+            content = USER_FILE.read_text(encoding="utf-8")
+            n = len(content)
             pct = n / USER_CAP
             if pct >= MEM_WARN:
                 problems.append(f"USER.md at {n}/{USER_CAP} chars ({int(pct*100)}%) — prune or offload to Hindsight")
@@ -775,9 +909,6 @@ def main():
         problems.append(f"Local memory check failed: {type(e).__name__}: {e}")
 
     # --- 9. Output: LLM auto-resolve → Telegram fallback -----------------
-    # v2.2: if issues were collected, try resolving them with z-ai/glm-5.2
-    # (one attempt). If any issues remain unresolved, send a Telegram DM
-    # notification. Silent if all issues are resolved or no issues found.
     if problems:
         # Step 9a: attempt LLM auto-resolution
         resolved, unresolved = try_resolve_issues_with_llm(problems)
@@ -790,6 +921,7 @@ def main():
 
         if unresolved:
             # Step 9c: notify user via Telegram DM for remaining issues
+            # v2.2.1: escape HTML in issue text to prevent Telegram parse errors
             timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
             tg_text = (
                 f"<b>🧠 Daily Memory Optimization</b>\n"
@@ -798,12 +930,18 @@ def main():
                 f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
             )
             for u in unresolved:
-                tg_text += f"  • {u}\n"
+                tg_text += f"  • {_escape_html(u)}\n"
 
-            send_telegram_notification(tg_text)
+            # v2.2.1: check return value and report delivery status accurately
+            tg_sent = send_telegram_notification(tg_text)
+            delivery_status = (
+                "Telegram DM sent" if tg_sent
+                else "Telegram DM delivery FAILED (check bot token / chat ID)"
+            )
 
             # Also print to stdout (for cron log visibility)
-            print("\n**🧠 Daily Memory Optimization — unresolved issues (Telegram DM sent)**\n")
+            mode = "dry-run" if args.dry_run else ("destructive" if ALLOW_DESTRUCTIVE else "safe")
+            print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
             for u in unresolved:
                 print(f"  ⚠️ {u}")
     # else: empty stdout -> cron stays silent

@@ -4,6 +4,17 @@
 Runs via cron (no_agent=True). When local MEMORY.md exceeds 75% capacity,
 offloads non-essential entries to Hindsight and removes them from local memory.
 
+v2.2.1 (Sep 2026): Safety patch — data-loss prevention, atomic writes, locking.
+  - Fixed mixed-success offload bug: failed entries are ALWAYS kept locally
+  - Atomic file writes via temp file + os.replace()
+  - Backup before rewriting MEMORY.md
+  - Advisory file lock (fcntl) prevents concurrent offload/daily runs
+  - Tags now passed in Hindsight retain body (TAG_MAP was previously unused)
+  - Idempotent document_id for retains (content-hash based)
+  - Dedup canonical detection fixed (canonical==0 OR 0 in duplicates)
+  - Character-count consistency (decode before counting, not st_size bytes)
+  - Config via environment variables (no hardcoded /root)
+
 v2.0 (Aug 2026): LLM-driven classification + semantic dedup.
   - Importance classification via llm_judge.classify_importance() (LLM-as-judge)
   - Semantic dedup via llm_judge.semantic_dedup() (replaces word-overlap >60%)
@@ -24,8 +35,11 @@ Non-essential entries (offloaded to Hindsight, LLM-judged):
   - Detailed environment configs that rarely change
 """
 
+import hashlib
 import json
+import os
 import sys
+import tempfile
 import types
 import urllib.request
 from pathlib import Path
@@ -38,12 +52,16 @@ try:
 except ImportError:
     llm_judge = None  # standalone run: use rule-based fallbacks
 
-# === Config ===
-MEMORY_FILE = Path("/root/.hermes/memories/MEMORY.md")
-HINDSIGHT_URL = "http://localhost:8888"
-BANK = "main"
-CAPACITY_MAX = 2200  # chars
-OFFLOAD_THRESHOLD = 0.75  # 75%
+# === Config (environment-overridable, no hardcoded /root) ===
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+MEMORY_FILE = Path(os.environ.get("MEMORY_FILE", str(HERMES_HOME / "memories" / "MEMORY.md")))
+HINDSIGHT_URL = os.environ.get("HINDSIGHT_URL", "http://localhost:8888")
+BANK = os.environ.get("HINDSIGHT_BANK", "main")
+CAPACITY_MAX = int(os.environ.get("MEMORY_CHARS", "2200"))  # chars
+OFFLOAD_THRESHOLD = float(os.environ.get("OFFLOAD_THRESHOLD", "0.75"))  # 75%
+LOCK_FILE = MEMORY_FILE.with_suffix(".lock")  # MEMORY.lock next to MEMORY.md
+BACKUP_DIR = MEMORY_FILE.parent / ".backups"
+MAX_BACKUPS = 5  # keep last N backups
 
 # Rule-based fallback prefixes (used when LLM unavailable)
 ESSENTIAL_PREFIXES = [
@@ -71,6 +89,86 @@ TAG_MAP = {
 }
 
 
+# === File locking ===
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False  # Windows — no fcntl
+
+
+class FileLock:
+    """Advisory file lock via fcntl.flock (prevents concurrent offload + daily runs).
+
+    On platforms without fcntl (Windows), this is a no-op — the caller should
+    be aware of the race risk in multi-process environments.
+    """
+
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self._fd = None
+
+    def __enter__(self):
+        if not _HAS_FCNTL:
+            return self
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = open(self.lock_path, "w")
+        fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *args):
+        if self._fd is not None:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+            self._fd.close()
+            self._fd = None
+
+
+# === Atomic write + backup ===
+
+def _make_backup(src: Path) -> Path | None:
+    """Create a timestamped backup of src. Returns backup path or None on failure."""
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        import time
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = BACKUP_DIR / f"{src.stem}_{ts}{src.suffix}"
+        backup.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        # Rotate: keep only MAX_BACKUPS
+        backups = sorted(BACKUP_DIR.glob(f"{src.stem}_*{src.suffix}"))
+        for old in backups[:-MAX_BACKUPS]:
+            old.unlink(missing_ok=True)
+        return backup
+    except Exception:
+        return None
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Write content to path atomically via temp file + os.replace().
+
+    Ensures MEMORY.md is never in a half-written state if the process crashes
+    mid-write. The temp file is created in the same directory (required for
+    os.replace to be atomic on the same filesystem).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except Exception:
+        # Clean up temp file on failure — never leave partial writes
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def read_memory_file():
     """Read MEMORY.md and return list of entries (strings)."""
     if not MEMORY_FILE.exists():
@@ -87,7 +185,7 @@ def read_memory_file():
 
 
 def get_memory_usage():
-    """Read raw char count from MEMORY.md."""
+    """Read decoded character count from MEMORY.md (not byte count)."""
     if not MEMORY_FILE.exists():
         return 0, CAPACITY_MAX
     content = MEMORY_FILE.read_text(encoding="utf-8")
@@ -107,6 +205,17 @@ def get_tags(entry):
     return ["offloaded", "memory-management"]
 
 
+def _stable_document_id(content: str) -> str:
+    """Generate a stable document_id for idempotent Hindsight retains.
+
+    Uses SHA-256 of normalized content with an L1-offload namespace prefix.
+    This makes retains idempotent — re-offloading the same content won't
+    create duplicates even if the dedup-check misses them.
+    """
+    normalized = " ".join(content.split()).strip().lower()
+    return f"l1-offload:{hashlib.sha256(normalized.encode()).hexdigest()[:16]}"
+
+
 def hindsight_health_check():
     """Check if Hindsight is healthy before offloading."""
     try:
@@ -120,6 +229,10 @@ def hindsight_health_check():
 
 def hindsight_recall_check(content):
     """Semantic recall to check if content is already in Hindsight (dedup).
+
+    v2.2.1: Fixed canonical detection — entry is a duplicate if it is the
+    canonical OR appears in the duplicates list (previously only checked
+    canonical==0, missing the case where Hindsight's copy is better-worded).
 
     v2.0: Uses LLM judge for semantic dedup when available.
     Falls back to word-overlap >60% if LLM unavailable.
@@ -144,8 +257,10 @@ def hindsight_recall_check(content):
                 # Batch: check all recalled results against the entry in one LLM call
                 dup_groups = llm_judge.semantic_dedup([content, *result_texts[:5]])
                 for g in dup_groups:
-                    if g["canonical"] == 0 and len(g["duplicates"]) > 0:
-                        return True  # entry is duplicate of a recalled result
+                    # v2.2.1: entry (index 0) is a duplicate if it's the canonical
+                    # OR appears in the duplicates list
+                    if g["canonical"] == 0 or 0 in g["duplicates"]:
+                        return True  # entry is already represented in Hindsight
                 return False
             # Fallback: word overlap
             for r in results:
@@ -161,9 +276,23 @@ def hindsight_recall_check(content):
         return False  # If recall fails, proceed with retain anyway
 
 
-def hindsight_retain(content, _tags=None):
-    """Store an entry in Hindsight."""
-    payload = json.dumps({"items": [{"content": content}]}).encode()
+def hindsight_retain(content, tags=None):
+    """Store an entry in Hindsight with tags and stable document_id.
+
+    v2.2.1: Tags and document_id are now included in the retain body
+    (previously tags were computed but never sent — TAG_MAP had no effect).
+    The document_id makes retains idempotent (re-offloading the same content
+    won't create duplicates).
+    """
+    body = {
+        "items": [{
+            "content": content,
+            "context": "L1 memory offload",
+            "tags": tags or [],
+            "document_id": _stable_document_id(content),
+        }]
+    }
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{HINDSIGHT_URL}/v1/default/banks/{BANK}/memories",
         data=payload,
@@ -178,9 +307,17 @@ def hindsight_retain(content, _tags=None):
 
 
 def rewrite_memory_file(entries_to_keep):
-    """Rewrite MEMORY.md with only the kept entries."""
+    """Rewrite MEMORY.md with only the kept entries (atomic + backup).
+
+    v2.2.1: Creates a backup before rewriting, then writes atomically via
+    temp file + os.replace(). If the process crashes mid-write, the original
+    file is intact and the backup is available for recovery.
+    """
+    # Backup before rewriting
+    if MEMORY_FILE.exists():
+        _make_backup(MEMORY_FILE)
     content = "".join(f"{entry.strip()}\n§\n" for entry in entries_to_keep)
-    MEMORY_FILE.write_text(content, encoding="utf-8")
+    atomic_write_text(MEMORY_FILE, content)
 
 
 def classify_entries(entries):
@@ -191,8 +328,9 @@ def classify_entries(entries):
     """
     if llm_judge is not None:
         essential_idx, offloadable_idx = llm_judge.classify_importance(entries)
-        essential = [entries[i] for i in essential_idx if i < len(entries)]
-        offloadable = [entries[i] for i in offloadable_idx if i < len(entries)]
+        # v2.2.1: strict bounds check on LLM-returned indices
+        essential = [entries[i] for i in essential_idx if 0 <= i < len(entries)]
+        offloadable = [entries[i] for i in offloadable_idx if 0 <= i < len(entries)]
         return essential, offloadable
     # Fallback: rule-based prefix matching
     essential = [e for e in entries if any(e.startswith(p) for p in ESSENTIAL_PREFIXES)]
@@ -201,6 +339,20 @@ def classify_entries(entries):
 
 
 def main():
+    """Offload non-essential memory entries to Hindsight.
+
+    Safety invariant (v2.2.1):
+        An entry may be removed from L1 only after durable L2 retention
+        or verified existing L2 presence. Failed entries are ALWAYS kept.
+
+    The file lock prevents concurrent execution by the 30-min offload cron
+    and the daily optimization job.
+    """
+    with FileLock(LOCK_FILE):
+        _do_offload()
+
+
+def _do_offload():
     # 1. Check Hindsight health
     if not hindsight_health_check():
         print("WARN: Hindsight not healthy — skipping offload cycle.")
@@ -211,7 +363,7 @@ def main():
     if not entries:
         sys.exit(0)  # Nothing to do
 
-    # 3. Check capacity
+    # 3. Check capacity (decoded chars, not bytes)
     used, capacity = get_memory_usage()
     usage_pct = used / capacity
     if usage_pct <= OFFLOAD_THRESHOLD:
@@ -226,34 +378,48 @@ def main():
         sys.exit(0)
 
     # 5. Offload each non-essential entry to Hindsight
-    offloaded = 0
-    failed = 0
+    # v2.2.1: Track success/failure explicitly — failed entries are KEPT.
+    #   Invariant: an entry is removed from L1 ONLY after durable L2
+    #   retention or verified existing L2 presence.
+    successfully_offloaded = []
+    failed_offloads = []
+
     for entry in offloadable:
         tags = get_tags(entry)
         try:
             # Dedup check — skip if already in Hindsight (LLM semantic or word-overlap)
             if hindsight_recall_check(entry):
-                offloaded += 1  # Count as offloaded (already there)
+                successfully_offloaded.append(entry)  # Already in L2 — safe to remove from L1
                 continue
             success = hindsight_retain(entry, tags)
             if success:
-                offloaded += 1
+                successfully_offloaded.append(entry)
             else:
-                failed += 1
+                failed_offloads.append(entry)
         except Exception:
-            failed += 1
+            failed_offloads.append(entry)
 
-    # 6. Rewrite local memory with only essential entries
-    if offloaded > 0:
-        rewrite_memory_file(essential)
+    # 6. Rewrite local memory: essential + FAILED entries (never lose data)
+    #    Only successfully-offloaded entries are removed from L1.
+    kept = list(essential) + failed_offloads
+
+    if successfully_offloaded:
+        rewrite_memory_file(kept)
 
     # 7. Report (only if something happened)
-    new_used = sum(len(e) for e in essential)
+    new_used = sum(len(e) for e in kept)
     new_pct = new_used / capacity
-    llm_status = "LLM-judged" if llm_judge is not None else "rule-based"
-    if offloaded > 0 or failed > 0:
-        print(f"Memory offload ({llm_status}): {offloaded} entries moved to Hindsight, {failed} failed. "
-              f"Local: {new_used}/{capacity} ({new_pct:.0%}). {len(essential)} essential entries kept.")
+    # v2.2.1: llm_status now accurately reflects whether LLM was actually used
+    llm_available = llm_judge is not None and llm_judge.is_llm_available() if llm_judge else False
+    llm_status = "LLM-judged" if llm_available else "rule-based"
+    if successfully_offloaded or failed_offloads:
+        print(
+            f"Memory offload ({llm_status}): "
+            f"{len(successfully_offloaded)} entries moved to Hindsight, "
+            f"{len(failed_offloads)} failed (kept locally). "
+            f"Local: {new_used}/{capacity} ({new_pct:.0%}). "
+            f"{len(essential)} essential + {len(failed_offloads)} failed entries kept."
+        )
 
 
 if __name__ == "__main__":

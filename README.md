@@ -25,9 +25,32 @@ The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** fo
 
 **LLM-optional** (MenteDB pattern): all operations degrade to rule-based fallbacks if the LLM endpoint is unavailable. The engine stays functional with no LLM.
 
-**Batch consolidation** (LycheeMemory V2 / RecMem): all entries sent in a single LLM call, not per-entry — 75-87% fewer LLM calls vs eager consolidation.
+**Batch consolidation** (LycheeMemory V2 / RecMem): entries sent in batched LLM calls (≤30 per batch), not per-entry — 75-87% fewer LLM calls vs eager consolidation.
 
 **Non-destructive invalidation**: dedup and contradiction resolution use `PATCH {"state":"invalidated"}` (recall-hidden, retained on disk for audit). Never `DELETE`.
+
+## v2.2.1 — Safety Patch (Sep 2026)
+
+Addresses critical data-loss, LLM action safety, and validation issues identified in code review:
+
+| Priority | Issue | Fix |
+|----------|-------|-----|
+| **P0** | Failed offloads removed from MEMORY.md | Failed entries are always kept locally — only successfully-offloaded entries are removed |
+| **P0** | LLM auto-resolver could invalidate memories from unconstrained plan | Destructive actions (invalidate, config_tune) disabled by default — requires `--allow-destructive` flag |
+| **P0** | LLM indices insufficiently validated (negative indices, overlaps) | Strict validation: bounds, no negatives, no canonical-in-duplicates, no overlapping groups, invalid responses rejected entirely |
+| **P0** | Tags computed but never sent in retain body | Tags and stable `document_id` now included in Hindsight retain requests |
+| **P0** | Dedup canonical detection missed canonical==1 case | Fixed: entry is duplicate if `canonical==0 OR 0 in duplicates` |
+| **P0** | Observations return 400 on PATCH | `curate_memory()` fetches `fact_type` first; observations resolved via source memories |
+| **P0** | Telegram HTML not escaped | `html.escape()` on all dynamic content; delivery status reported accurately |
+| **P1** | Hardcoded `/root`, ports, limits | All paths/URLs/banks/caps configurable via environment variables |
+| **P1** | No file lock — cron race risk | `FileLock` (fcntl.flock) prevents concurrent offload + daily runs |
+| **P1** | `st_size` bytes mixed with char limits | Consistent decoded character counting |
+| **P2** | Tests covered helpers but not destructive workflows | 72 tests: offload safety (partial/all-fail/all-success), LLM validation (negatives, overlaps, self-pairs), safe invalidation (fact_type), HTML escaping, destructive flag |
+| **P2** | No pyproject.toml, CI | Added `pyproject.toml`, GitHub Actions CI (ruff, mypy, bandit, pytest, Python 3.10-3.12) |
+
+**Safety invariant**: An entry may be removed from L1 only after durable L2 retention or verified existing L2 presence.
+
+**LLM-as-advisor model**: The LLM proposes actions, but destructive operations (invalidate, config_tune) require explicit opt-in via `--allow-destructive`. Consolidation (non-destructive) is always allowed. Config keys are allowlisted.
 
 ### LLM-as-Judge architecture
 
@@ -61,8 +84,10 @@ flowchart LR
     MEM2 --> CD
 
     IC -- LLM available --> A1
-    SD -- LLM available --> A2
-    CD -- LLM available --> A3
+    SD -- LLM available --> VAL1[Validate indices<br/>bounds, no negatives,<br/>no overlaps]
+    CD -- LLM available --> VAL2[Validate pairs<br/>2 distinct indices,<br/>newer_index in pair]
+    VAL1 --> A2
+    VAL2 --> A3
 
     IC -- LLM unavailable --> FB1
     SD -- LLM unavailable --> FB2
@@ -76,10 +101,12 @@ flowchart LR
     classDef judge fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef fallback fill:#1f2937,stroke:#f59e0b,color:#fbbf24
     classDef action fill:#1f2937,stroke:#3b82f6,color:#93c5fd
+    classDef validate fill:#1f2937,stroke:#ef4444,color:#fca5a5
     class MEM1,MEM2 input
     class IC,SD,CD judge
     class FB1,FB2,FB3 fallback
     class A1,A2,A3 action
+    class VAL1,VAL2 validate
 ```
 
 **Key design**: LLM-optional (MenteDB pattern) — every operation degrades to rule-based fallback if the LLM endpoint is unavailable. Batch consolidation (LycheeMemory V2) sends all entries in a single LLM call (≤30 per batch), reducing LLM calls 75-87% vs per-entry processing.
@@ -106,7 +133,7 @@ cp agent-memory-optimization/scripts/*.py ~/.hermes/scripts/
 
 Requires a Hermes Agent instance. The L2 procedure targets a [Hindsight](https://hindsight.vectorize.io) (Vectorize.io) server; the L3 procedure targets a Karpathy-pattern LLM Wiki. Both layers are optional — the L1 procedure works standalone.
 
-**LLM-as-judge** (v2.1): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `z-ai/glm-5.2` by default — an open-weight MIT-licensed model with a 1M context window and strong reasoning quality. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks.
+**LLM-as-judge** (v2.1+): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `z-ai/glm-5.2` by default — an open-weight MIT-licensed model with a 1M context window. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks. The `llm_status` reported by `memory_offload.py` now accurately reflects whether the LLM endpoint is actually reachable (via `is_llm_available()`), not just whether the module imported.
 
 ## Procedure (summary)
 
@@ -149,8 +176,8 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 7. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
 8. L1 capacity check (≥90% warns / triggers Hindsight offload — now LLM-driven classification)
 9. L3 wiki lint-lite (≥5 pages >90 days stale warns)
-10. **LLM auto-resolve** (v2.2): if any issues were collected, attempt to resolve them with z-ai/glm-5.2 (one LLM call) — consolidate, invalidate stale memories, or tune Hindsight config
-11. **Telegram notification** (v2.2): if any issues remain unresolved after the LLM attempt, send a DM to the user. Silent if all issues were resolved or no issues found.
+10. **LLM auto-resolve** (v2.2, updated v2.2.1): if any issues were collected, attempt to resolve them with `z-ai/glm-5.2` (one LLM call) — consolidate (always allowed), invalidate stale memories, or tune Hindsight config. **Destructive actions (invalidate, config_tune) are disabled by default** — pass `--allow-destructive` to enable. Config keys are allowlisted.
+11. **Telegram notification** (v2.2, updated v2.2.1): if any issues remain unresolved after the LLM attempt, send a DM to the user. HTML content is escaped. Delivery status is reported accurately (was always "sent" even on failure). Silent if all issues are resolved or no issues found.
 
 Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
 
@@ -211,6 +238,8 @@ flowchart TD
 - Exit 0 always; errors surface via stdout, never via nonzero exit
 - The script's own smoke-test retain means a small Knowledge Base always reads stale in the tree — hence the exact per-page mental-model check for KBs ≤ 25 pages
 - **LLM auto-resolve** (v2.2): the script tries to fix issues itself before bothering the user — only truly unresolved issues reach Telegram
+- **Safety invariant** (v2.2.1): an entry may be removed from L1 only after durable L2 retention or verified existing L2 presence — failed offloads are always kept locally
+- **LLM-as-advisor** (v2.2.1): destructive actions (invalidate, config_tune) require `--allow-destructive`; LLM indices are strictly validated (no negatives, no overlaps); observations are handled via source memories, not direct PATCH
 
 ### Sample report (agent-driven run)
 

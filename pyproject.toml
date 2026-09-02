@@ -1,0 +1,82 @@
+[project]
+name = "agent-memory-optimization"
+version = "2.2.1"
+description = "Three-layer AI agent memory optimization: L1 local, L2 Hindsight semantic recall, L3 LLM Wiki"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+authors = [{name = "Iris", email = "iris@green-needle-tech.com"}]
+keywords = ["agent-memory", "hindsight", "llm", "memory-optimization", "hermes"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Runtime uses only Python stdlib (urllib, json, hashlib, etc.)
+    # No third-party packages required for production use
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "bandit>=1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/Green-Needle-Tech/agent-memory-optimization"
+Repository = "https://github.com/Green-Needle-Tech/agent-memory-optimization"
+Issues = "https://github.com/Green-Needle-Tech/agent-memory-optimization/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C90", "I", "UP", "B", "S"]
+ignore = [
+    "S310",  # urllib.urlopen — trusted internal URLs, not user input
+    "S603",  # subprocess usage — not present, but blanket ignore for false positives
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 60  # operational scripts are inherently branch-heavy
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is fine in tests
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "fcntl"
+ignore_missing_imports = true  # Windows doesn't have fcntl
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = ["B310"]  # urllib.urlopen on trusted internal URLs
