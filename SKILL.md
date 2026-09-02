@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 2.1.0
+version: 2.2.0
 author: Iris
 license: MIT
 trigger: >-
@@ -129,16 +129,18 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 - Daily memory optimization cron at 8:00 AM SGT (no-agent Python, `scripts/daily_memory_optimization.py` in this repo — deploy a copy to `~/.hermes/scripts/` next to `memory_offload.py`).
 - Hindsight health watchdog every 15min.
 
-### Daily cron behavior (v2.0.0, targets Hindsight 0.8+; LLM-driven dedup/contradiction; KP checks on 0.9+)
+### Daily cron behavior (v2.2.0, targets Hindsight 0.8+; LLM-driven dedup/contradiction; KP checks on 0.9+; LLM auto-resolve + Telegram)
 1. `POST /consolidate` → poll operation to terminal state (max 8 min)
 2. Recall smoke-test after consolidation (over-prune check)
 3. **Retain smoke-test**: `success:true` AND `total_tokens > 0` — the exact step that silently fails while health stays green
 4. Bank stats: `total_nodes > 0`, `failed_operations` trend vs last run (state file)
-5. **LLM semantic dedup pass** (NEW v2.0): recall recent memories (max 50), `llm_judge.semantic_dedup()` identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
-6. **LLM contradiction scan** (NEW v2.0): recall recent memories, `llm_judge.detect_contradictions()` finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts. LLM-optional.
+5. **LLM semantic dedup pass** (v2.0): recall recent memories (max 50), `llm_judge.semantic_dedup()` identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
+6. **LLM contradiction scan** (v2.0): recall recent memories, `llm_judge.detect_contradictions()` finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts. LLM-optional.
 7. **Knowledge Pages health** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages are stale — pages are projected views that inherit L2's failure modes. ⚠️ The tree's `is_stale` is a single bank-wide `last_memory_write_at` signal — on a bank that receives daily writes (including this script's own smoke-test retain) every page reads stale (false positive). For KBs ≤25 pages the script queries each page's mental model (`GET /mental-models/{id}`) for the exact per-page `is_stale`. 404 on older versions = skip silently
 8. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload (LLM-driven classification)
 9. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
+10. **LLM auto-resolve** (v2.2): if any issues were collected, attempt to resolve them with `z-ai/glm-5.2` (one LLM call) — consolidate, invalidate stale memories, or tune Hindsight config. LLM-optional — all issues remain unresolved if the LLM is unavailable.
+11. **Telegram notification** (v2.2): if any issues remain unresolved after the LLM attempt, send a DM to the user (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_HOME_CHANNEL` from `~/.hermes/.env`). Silent if all issues were resolved or no issues found.
 
 Silent on success (empty stdout); exit 0 always — errors surface via stdout, never via nonzero exit.
 

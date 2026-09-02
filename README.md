@@ -144,11 +144,13 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 2. Recall smoke-test (consolidation over-prune check)
 3. Retain smoke-test — `total_tokens > 0` proves fact extraction ran (health green ≠ writes working)
 4. Bank stats: node count + failed_operations trend vs last run
-5. **LLM semantic dedup pass** (NEW v2.0): recall recent memories (max 50), LLM identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
-6. **LLM contradiction scan** (NEW v2.0): recall recent memories, LLM finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts.
+5. **LLM semantic dedup pass** (v2.0): recall recent memories (max 50), LLM identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
+6. **LLM contradiction scan** (v2.0): recall recent memories, LLM finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts.
 7. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
 8. L1 capacity check (≥90% warns / triggers Hindsight offload — now LLM-driven classification)
 9. L3 wiki lint-lite (≥5 pages >90 days stale warns)
+10. **LLM auto-resolve** (v2.2): if any issues were collected, attempt to resolve them with z-ai/glm-5.2 (one LLM call) — consolidate, invalidate stale memories, or tune Hindsight config
+11. **Telegram notification** (v2.2): if any issues remain unresolved after the LLM attempt, send a DM to the user. Silent if all issues were resolved or no issues found.
 
 Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
 
@@ -171,7 +173,7 @@ flowchart TD
     KP2 -- no --> KP4[Tree is_stale<br/>bank-wide approximation]
     KP3 --> KP5{> 50% pages stale?}
     KP4 --> KP5
-    KP5 -- yes --> WARN[Report issue:<br/>pages falling behind]
+    KP5 -- yes --> COLLECT[Collect issue]
     KP5 -- no --> L1A
 
     L1A[L1: MEMORY.md / USER.md<br/>capacity check] --> L1B{MEMORY.md<br/>≥ 90%?}
@@ -180,28 +182,35 @@ flowchart TD
     OFF --> L3A
 
     L3A[L3: Wiki lint-lite<br/>~/.hermes/kb] --> L3B{≥ 5 pages<br/>> 90 days stale?}
-    L3B -- yes --> WARN
+    L3B -- yes --> COLLECT
     L3B -- no --> OUT{Any issues<br/>collected?}
-    WARN --> OUT
+    COLLECT --> OUT
 
-    OUT -- yes --> MSG([Deliver issue report<br/>to Telegram])
-    OUT -- no --> SILENT([Silent: empty stdout<br/>exit 0])
+    OUT -- yes --> RESOLVE[LLM auto-resolve<br/>z-ai/glm-5.2 one try]
+    RESOLVE --> RESOLVED{All issues<br/>resolved?}
+    RESOLVED -- yes --> SILENT([Silent: empty stdout<br/>exit 0])
+    RESOLVED -- no --> TG([Send Telegram DM<br/>to user])
+    OUT -- no --> SILENT
     ERR --> OUT
 
     classDef layer fill:#1f2937,stroke:#6366f1,color:#e5e7eb
     classDef decision fill:#1f2937,stroke:#f59e0b,color:#e5e7eb
     classDef warn fill:#1f2937,stroke:#ef4444,color:#fca5a5
+    classDef resolve fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef done fill:#1f2937,stroke:#10b981,color:#a7f3d0
-    class L2A,L2B,L2C,L2D,KP3,KP4,L1A,L3A,OFF layer
-    class POLL,KP,KP2,KP5,L1B,L3B,OUT decision
-    class WARN,ERR warn
-    class START,MSG,SILENT done
+    classDef tg fill:#1f2937,stroke:#3b82f6,color:#93c5fd
+    class L2A,L2B,L2C,L2D,KP3,KP4,L1A,L3A,OFF,COLLECT layer
+    class POLL,KP,KP2,KP5,L1B,L3B,OUT,RESOLVED decision
+    class ERR,RESOLVE warn
+    class START,SILENT done
+    class TG tg
 ```
 
 **Key invariants**
 - Health green ≠ writes working — the retain smoke-test (`total_tokens > 0`) catches silent LLM-layer failures
 - Exit 0 always; errors surface via stdout, never via nonzero exit
 - The script's own smoke-test retain means a small Knowledge Base always reads stale in the tree — hence the exact per-page mental-model check for KBs ≤ 25 pages
+- **LLM auto-resolve** (v2.2): the script tries to fix issues itself before bothering the user — only truly unresolved issues reach Telegram
 
 ### Sample report (agent-driven run)
 

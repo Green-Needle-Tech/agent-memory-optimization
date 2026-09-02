@@ -21,6 +21,13 @@ v2.0.1 (Aug 2026): self-pollution fixes from live-run false positives.
   - Stable-conflict flags deduped across runs via fingerprint state file
     (an unresolved flag reports once, not daily)
 
+v2.2 (Sep 2026): LLM auto-resolve + Telegram notification.
+  - After collecting issues, the script attempts to resolve them using
+    z-ai/glm-5.2 (one LLM call): consolidate, invalidate stale memories,
+    or tune Hindsight config
+  - Issues the LLM cannot auto-resolve are sent as a Telegram DM notification
+  - Silent if all issues are resolved by the LLM or no issues found
+
 Behavior (per memory-optimization skill v2.0.0):
   L2 (Hindsight, any 0.8+; Knowledge Pages checks activate on 0.9+):
     1. POST /consolidate -> poll operation to terminal state (max 8 min)
@@ -45,6 +52,7 @@ Output only when something needs attention; else silent. Exit 0 always
 import contextlib
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -103,6 +111,166 @@ META_MEMORY_PATTERNS = [                # reports ABOUT past maintenance runs = 
 ]
 META_MEMORY_RE = re.compile("|".join(META_MEMORY_PATTERNS), re.IGNORECASE)
 FLAG_STATE_FILE = Path("/root/.hermes/scripts/.daily_memory_opt_flags.json")
+
+# Telegram notification config (for unresolved issues)
+ENV_FILE = Path("/root/.hermes/.env")
+TG_MAX_MSG_LEN = 4000   # Telegram message limit is 4096; keep margin
+
+
+def _read_env_var(var_name):
+    """Read a variable from environment or ~/.hermes/.env file."""
+    val = os.environ.get(var_name, "")
+    if val:
+        return val
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(var_name + "="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def try_resolve_issues_with_llm(problems):
+    """Attempt to resolve collected issues using z-ai/glm-5.2 (one try).
+
+    Sends the issue list to the LLM with context about the memory system
+    and available Hindsight API operations. The LLM returns a JSON action
+    plan; each action is executed (invalidate stale memory, consolidate,
+    etc.). Returns (resolved_issues, unresolved_issues) lists.
+
+    If llm_judge is unavailable or the LLM call fails, all issues remain
+    unresolved.
+    """
+    if llm_judge is None:
+        return [], list(problems)
+
+    system_prompt = (
+        "You are a memory maintenance resolver for a three-layer AI agent memory system.\n"
+        "L1 = local MEMORY.md/USER.md (always injected, char-capped).\n"
+        "L2 = Hindsight server at localhost:8888 (semantic recall, consolidation, Knowledge Pages).\n"
+        "L3 = LLM Wiki (git-versioned markdown knowledge base).\n\n"
+        "You receive a list of issues found during daily maintenance.\n"
+        "For each issue, decide if it can be auto-resolved with an API action.\n"
+        "Available actions:\n"
+        '  - {"action": "consolidate"} — POST /consolidate to trigger Hindsight consolidation\n'
+        '  - {"action": "invalidate", "reason": "...", "query": "search terms"} — recall memories\n'
+        '    matching query, invalidate the stale ones (PATCH state=invalidated)\n'
+        '  - {"action": "config_tune", "key": "...", "value": "..."} — PATCH /config\n'
+        '  - {"action": "skip"} — cannot auto-resolve, needs human review\n\n'
+        "Return a JSON array of objects, one per issue:\n"
+        '  {"issue_index": 0, "action": "consolidate|invalidate|config_tune|skip",\n'
+        '   "reason": "brief explanation", "query": "optional search terms",\n'
+        '   "key": "optional config key", "value": "optional config value"}\n'
+        "Respond with ONLY the JSON array, no other text."
+    )
+
+    issue_list = "\n".join(f"  [{i}] {p}" for i, p in enumerate(problems))
+    user_prompt = f"Issues found during daily memory optimization:\n{issue_list}\n\nReturn the JSON action plan."
+
+    try:
+        response = llm_judge._llm_chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=3000,
+        )
+        if not response:
+            return [], list(problems)
+
+        plan = llm_judge._parse_json_response(response)
+        if not plan or not isinstance(plan, list):
+            return [], list(problems)
+
+        resolved, unresolved = [], []
+
+        for item in plan:
+            idx = item.get("issue_index", -1)
+            if idx < 0 or idx >= len(problems):
+                continue
+            issue = problems[idx]
+            action = item.get("action", "skip")
+
+            if action == "consolidate":
+                try:
+                    http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
+                    resolved.append(f"{issue} → resolved (consolidation triggered)")
+                except Exception:
+                    unresolved.append(issue)
+
+            elif action == "invalidate":
+                query = item.get("query", "")
+                reason = item.get("reason", "stale memory invalidated by LLM resolver")
+                if query:
+                    memories = recall_recent_memories(query=query, limit=10)
+                    invalidated = 0
+                    for m in memories:
+                        if invalidate_memory(m["id"], reason):
+                            invalidated += 1
+                    if invalidated > 0:
+                        resolved.append(f"{issue} → resolved ({invalidated} memories invalidated)")
+                    else:
+                        unresolved.append(issue)
+                else:
+                    unresolved.append(issue)
+
+            elif action == "config_tune":
+                key = item.get("key", "")
+                value = item.get("value", "")
+                if key:
+                    try:
+                        http("PATCH", f"/v1/default/banks/{BANK}/config", timeout=120,
+                             body={"updates": {key: value}})
+                        resolved.append(f"{issue} → resolved (config {key}={value})")
+                    except Exception:
+                        unresolved.append(issue)
+                else:
+                    unresolved.append(issue)
+
+            else:  # skip or unknown
+                unresolved.append(issue)
+
+        return resolved, unresolved
+
+    except Exception:
+        return [], list(problems)
+
+
+def send_telegram_notification(text):
+    """Send a message to the user's Telegram DM via Bot API.
+
+    Reads TELEGRAM_BOT_TOKEN and TELEGRAM_HOME_CHANNEL from ~/.hermes/.env.
+    Returns True on success, False on failure (silent — never crash the cron).
+    """
+    bot_token = _read_env_var("TELEGRAM_BOT_TOKEN")
+    chat_id = _read_env_var("TELEGRAM_HOME_CHANNEL")
+    if not bot_token or not chat_id:
+        return False
+
+    # Truncate to Telegram limit
+    if len(text) > TG_MAX_MSG_LEN:
+        text = text[:TG_MAX_MSG_LEN - 20] + "\n\n…(truncated)"
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        body = json.dumps({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
+            resp.read()
+        return True
+    except Exception:
+        return False
 
 
 def http(method, path, timeout=120, body=None):
@@ -606,11 +774,38 @@ def main():
     except Exception as e:
         problems.append(f"Local memory check failed: {type(e).__name__}: {e}")
 
-    # --- 9. Output ------------------------------------------------------
+    # --- 9. Output: LLM auto-resolve → Telegram fallback -----------------
+    # v2.2: if issues were collected, try resolving them with z-ai/glm-5.2
+    # (one attempt). If any issues remain unresolved, send a Telegram DM
+    # notification. Silent if all issues are resolved or no issues found.
     if problems:
-        print("**🧠 Daily Memory Optimization — issues found**\n")
-        for p in problems:
-            print(f"  • {p}")
+        # Step 9a: attempt LLM auto-resolution
+        resolved, unresolved = try_resolve_issues_with_llm(problems)
+
+        # Step 9b: build output report
+        if resolved:
+            print("**🧠 Daily Memory Optimization — issues auto-resolved**\n")
+            for r in resolved:
+                print(f"  ✅ {r}")
+
+        if unresolved:
+            # Step 9c: notify user via Telegram DM for remaining issues
+            timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+            tg_text = (
+                f"<b>🧠 Daily Memory Optimization</b>\n"
+                f"<i>{timestamp}</i>\n\n"
+                f"<b>{len(unresolved)} issue(s) need your attention "
+                f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
+            )
+            for u in unresolved:
+                tg_text += f"  • {u}\n"
+
+            send_telegram_notification(tg_text)
+
+            # Also print to stdout (for cron log visibility)
+            print("\n**🧠 Daily Memory Optimization — unresolved issues (Telegram DM sent)**\n")
+            for u in unresolved:
+                print(f"  ⚠️ {u}")
     # else: empty stdout -> cron stays silent
 
 
