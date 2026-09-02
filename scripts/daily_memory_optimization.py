@@ -158,6 +158,10 @@ FLAG_STATE_FILE = HERMES_HOME / "scripts" / ".daily_memory_opt_flags.json"
 # Telegram notification config (for unresolved issues)
 TG_MAX_MSG_LEN = 4000   # Telegram message limit is 4096; keep margin
 
+# v2.4: Constants for previously-duplicated literals (SonarCloud design issues)
+META_NOISE_REASON = "meta_noise: report about a past maintenance run"
+ISO_TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"
+
 
 def _read_env_var(var_name):
     """Read a variable from environment or ~/.hermes/.env file."""
@@ -267,23 +271,17 @@ def invalidate_memory(mid, reason="duplicate"):
     return curate_memory(mid, action="invalidate", reason=reason)
 
 
-def try_resolve_issues_with_llm(problems):
-    """Attempt to resolve collected issues using z-ai/glm-5.2 (one try).
+# Allowlisted config keys (v2.2.1: prevent arbitrary config mutation)
+ALLOWED_CONFIG_KEYS = {
+    "recall_budget_function", "recall_max_tokens",
+    "consolidation_max_memories_per_round",
+    "retain_mission", "reflect_mission",
+    "enable_auto_consolidation",
+}
 
-    v2.2.1: LLM auto-mutation is DISABLED by default. The LLM is used as
-    an ADVISOR only — it proposes actions, but destructive actions
-    (invalidate, config_tune) are only executed if ALLOW_DESTRUCTIVE is True.
-    Consolidation (non-destructive) is always allowed.
 
-    Sends the issue list to the LLM with context about the memory system
-    and available Hindsight API operations. The LLM returns a JSON action
-    plan; each action is validated against a typed policy before execution.
-
-    Returns (resolved_issues, unresolved_issues) lists.
-    """
-    if llm_judge is None:
-        return [], list(problems)
-
+def _build_resolver_prompts(problems):
+    """Build system and user prompts for the LLM resolver."""
     system_prompt = (
         "You are a memory maintenance resolver for a three-layer AI agent memory system.\n"
         "L1 = local MEMORY.md/USER.md (always injected, char-capped).\n"
@@ -303,9 +301,80 @@ def try_resolve_issues_with_llm(problems):
         '   "key": "optional config key", "value": "optional config value"}\n'
         "Respond with ONLY the JSON array, no other text."
     )
-
     issue_list = "\n".join(f"  [{i}] {p}" for i, p in enumerate(problems))
     user_prompt = f"Issues found during daily memory optimization:\n{issue_list}\n\nReturn the JSON action plan."
+    return system_prompt, user_prompt
+
+
+def _execute_resolve_action(item, issue):
+    """Execute a single LLM-proposed resolve action. Returns resolution string or None (unresolved)."""
+    action = item.get("action", "skip")
+
+    # Consolidate is always safe (non-destructive)
+    if action == "consolidate":
+        try:
+            http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
+            return f"{issue} → resolved (consolidation triggered)"
+        except Exception:
+            return None
+
+    # Destructive actions require --allow-destructive flag (v2.2.1)
+    if action == "invalidate" and ALLOW_DESTRUCTIVE:
+        return _execute_invalidate_action(item, issue)
+
+    if action == "config_tune" and ALLOW_DESTRUCTIVE:
+        return _execute_config_tune_action(item, issue)
+
+    # skip, unknown, or destructive action without --allow-destructive
+    return None
+
+
+def _execute_invalidate_action(item, issue):
+    """Execute an invalidate action. Returns resolution string or None."""
+    query = item.get("query", "")
+    reason = item.get("reason", "stale memory invalidated by LLM resolver")
+    if not query:
+        return None
+    memories = recall_recent_memories(query=query, limit=10)
+    invalidated = sum(1 for m in memories if invalidate_memory(m["id"], reason))
+    if invalidated > 0:
+        return f"{issue} → resolved ({invalidated} memories invalidated)"
+    return None
+
+
+def _execute_config_tune_action(item, issue):
+    """Execute a config_tune action. Returns resolution string or None."""
+    key = item.get("key", "")
+    value = item.get("value", "")
+    # v2.2.1: allowlist config keys
+    if not key or key not in ALLOWED_CONFIG_KEYS:
+        return None
+    try:
+        http("PATCH", f"/v1/default/banks/{BANK}/config", timeout=120,
+             body={"updates": {key: value}})
+        return f"{issue} → resolved (config {key}={value})"
+    except Exception:
+        return None
+
+
+def try_resolve_issues_with_llm(problems):
+    """Attempt to resolve collected issues using z-ai/glm-5.2 (one try).
+
+    v2.2.1: LLM auto-mutation is DISABLED by default. The LLM is used as
+    an ADVISOR only — it proposes actions, but destructive actions
+    (invalidate, config_tune) are only executed if ALLOW_DESTRUCTIVE is True.
+    Consolidation (non-destructive) is always allowed.
+
+    Sends the issue list to the LLM with context about the memory system
+    and available Hindsight API operations. The LLM returns a JSON action
+    plan; each action is validated against a typed policy before execution.
+
+    Returns (resolved_issues, unresolved_issues) lists.
+    """
+    if llm_judge is None:
+        return [], list(problems)
+
+    system_prompt, user_prompt = _build_resolver_prompts(problems)
 
     try:
         response = llm_judge._llm_chat(
@@ -323,63 +392,15 @@ def try_resolve_issues_with_llm(problems):
             return [], list(problems)
 
         resolved, unresolved = [], []
-
-        # Allowlisted config keys (v2.2.1: prevent arbitrary config mutation)
-        ALLOWED_CONFIG_KEYS = {
-            "recall_budget_function", "recall_max_tokens",
-            "consolidation_max_memories_per_round",
-            "retain_mission", "reflect_mission",
-            "enable_auto_consolidation",
-        }
-
         for item in plan:
             idx = item.get("issue_index", -1)
             if not isinstance(idx, int) or idx < 0 or idx >= len(problems):
                 continue
             issue = problems[idx]
-            action = item.get("action", "skip")
-
-            # Consolidate is always safe (non-destructive)
-            if action == "consolidate":
-                try:
-                    http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
-                    resolved.append(f"{issue} → resolved (consolidation triggered)")
-                except Exception:
-                    unresolved.append(issue)
-
-            # Destructive actions require --allow-destructive flag (v2.2.1)
-            elif action == "invalidate" and ALLOW_DESTRUCTIVE:
-                query = item.get("query", "")
-                reason = item.get("reason", "stale memory invalidated by LLM resolver")
-                if query:
-                    memories = recall_recent_memories(query=query, limit=10)
-                    invalidated = 0
-                    for m in memories:
-                        if invalidate_memory(m["id"], reason):
-                            invalidated += 1
-                    if invalidated > 0:
-                        resolved.append(f"{issue} → resolved ({invalidated} memories invalidated)")
-                    else:
-                        unresolved.append(issue)
-                else:
-                    unresolved.append(issue)
-
-            elif action == "config_tune" and ALLOW_DESTRUCTIVE:
-                key = item.get("key", "")
-                value = item.get("value", "")
-                # v2.2.1: allowlist config keys
-                if key and key in ALLOWED_CONFIG_KEYS:
-                    try:
-                        http("PATCH", f"/v1/default/banks/{BANK}/config", timeout=120,
-                             body={"updates": {key: value}})
-                        resolved.append(f"{issue} → resolved (config {key}={value})")
-                    except Exception:
-                        unresolved.append(issue)
-                else:
-                    unresolved.append(issue)
-
+            result = _execute_resolve_action(item, issue)
+            if result:
+                resolved.append(result)
             else:
-                # skip, unknown, or destructive action without --allow-destructive
                 unresolved.append(issue)
 
         return resolved, unresolved
@@ -524,7 +545,7 @@ def invalidate_meta_memories(memories, problems):
     removed = 0
     for m in memories:
         if META_MEMORY_RE.search(m.get("content", "")) and invalidate_memory(
-            m["id"], reason="meta_noise: report about a past maintenance run"
+            m["id"], reason=META_NOISE_REASON
         ):
             removed += 1
     if removed:
@@ -572,6 +593,49 @@ def flag_fingerprint(pair_contents):
     return hashlib.sha256(f"{a}||{b}".encode()).hexdigest()
 
 
+def _dedup_invalidate_records(records, dup_groups, problems, total_source):
+    """Invalidate duplicate memories from structured records (v2.3 path)."""
+    invalidated = 0
+    for group in dup_groups:
+        for dup_idx in group["duplicates"]:
+            if not (0 <= dup_idx < len(records)):
+                continue
+            mid = records[dup_idx].id
+            # v2.4: audit log
+            if memory_records is not None:
+                memory_records.append_audit_log(memory_records.AuditEntry(
+                    timestamp=time.strftime(ISO_TIMESTAMP_FMT, time.gmtime()),
+                    action="invalidate",
+                    memory_id=mid,
+                    before_state={"state": records[dup_idx].state, "fact_type": records[dup_idx].fact_type},
+                    reason="semantic_duplicate",
+                ))
+            if invalidate_memory(mid, reason="semantic_duplicate"):
+                invalidated += 1
+    if invalidated > 0:
+        problems.append(
+            f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
+            f"(non-destructive — retained on disk for audit). "
+            f"Scanned {len(records)}/{total_source} source memories (cursor-based)."
+        )
+
+
+def _dedup_invalidate_recall(memories, dup_groups, problems):
+    """Invalidate duplicate memories from recall-based approach (v2.0 path)."""
+    invalidated = 0
+    for group in dup_groups:
+        for dup_idx in group["duplicates"]:
+            if 0 <= dup_idx < len(memories):
+                mid = memories[dup_idx]["id"]
+                if invalidate_memory(mid, reason="semantic_duplicate"):
+                    invalidated += 1
+    if invalidated > 0:
+        problems.append(
+            f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
+            f"(non-destructive — retained on disk for audit)"
+        )
+
+
 def llm_semantic_dedup_pass(problems, memories=None):
     """LLM-driven semantic dedup pass (Step 5, new in v2.0).
 
@@ -609,34 +673,9 @@ def llm_semantic_dedup_pass(problems, memories=None):
 
         # Prepare safe records for LLM judging (PII redacted)
         safe_records = memory_records.prepare_for_judging(records)
-
-        # Build content list from safe records for the LLM
         contents = [r["content"] for r in safe_records]
         dup_groups = llm_judge.semantic_dedup(contents)
-
-        invalidated = 0
-        for group in dup_groups:
-            for dup_idx in group["duplicates"]:
-                if 0 <= dup_idx < len(records):
-                    mid = records[dup_idx].id
-                    # v2.4: audit log
-                    if memory_records is not None:
-                        memory_records.append_audit_log(memory_records.AuditEntry(
-                            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-                            action="invalidate",
-                            memory_id=mid,
-                            before_state={"state": records[dup_idx].state, "fact_type": records[dup_idx].fact_type},
-                            reason="semantic_duplicate",
-                        ))
-                    if invalidate_memory(mid, reason="semantic_duplicate"):
-                        invalidated += 1
-
-        if invalidated > 0:
-            problems.append(
-                f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
-                f"(non-destructive — retained on disk for audit). "
-                f"Scanned {len(records)}/{total_source} source memories (cursor-based)."
-            )
+        _dedup_invalidate_records(records, dup_groups, problems, total_source)
         return
 
     # Fallback: old recall-based approach (v2.0)
@@ -647,24 +686,227 @@ def llm_semantic_dedup_pass(problems, memories=None):
 
     contents = [m["content"] for m in memories]
     dup_groups = llm_judge.semantic_dedup(contents)
-
-    invalidated = 0
-    for group in dup_groups:
-        for dup_idx in group["duplicates"]:
-            if 0 <= dup_idx < len(memories):
-                mid = memories[dup_idx]["id"]
-                if invalidate_memory(mid, reason="semantic_duplicate"):
-                    invalidated += 1
-
-    if invalidated > 0:
-        problems.append(
-            f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
-            f"(non-destructive — retained on disk for audit)"
-        )
+    _dedup_invalidate_recall(memories, dup_groups, problems)
 
 
 def _normalize_text(s):
     return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _handle_recency_wins_records(records, pair, reason, prev_flags, new_flags, problems):
+    """Handle a recency_wins contradiction pair using structured records. Returns (invalidated, flagged)."""
+    rec_a = records[pair[0]]
+    rec_b = records[pair[1]]
+    newer, older = memory_records.resolve_recency((rec_a, rec_b))
+
+    if older is not None:
+        # Deterministic recency — invalidate the older one
+        if memory_records is not None:
+            memory_records.append_audit_log(memory_records.AuditEntry(
+                timestamp=time.strftime(ISO_TIMESTAMP_FMT, time.gmtime()),
+                action="invalidate",
+                memory_id=older.id,
+                before_state={"state": older.state, "fact_type": older.fact_type},
+                after_state={"state": "invalidated"},
+                reason=f"superseded (deterministic recency): {reason}",
+            ))
+        if invalidate_memory(older.id, reason=f"superseded: {reason}"):
+            return 1, 0
+        return 0, 0
+
+    # Missing/equal timestamps — can't determine recency, flag for human
+    pair_contents = [rec_a.content, rec_b.content]
+    fp = flag_fingerprint(pair_contents)
+    if fp in prev_flags:
+        return 0, 0
+    new_flags.add(fp)
+    problems.append(
+        f"LLM contradiction scan: state-change conflict but timestamps "
+        f"missing/equal — needs manual recency check — "
+        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
+    )
+    return 0, 1
+
+
+def _handle_stable_conflict_records(records, pair, reason, prev_flags, new_flags, problems):
+    """Handle a stable_conflict pair using structured records. Returns (invalidated, flagged)."""
+    pair_contents = [records[pair[0]].content, records[pair[1]].content]
+    a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
+    if a == b or a.startswith(b) or b.startswith(a):
+        shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
+        if invalidate_memory(records[shorter_idx].id, reason="semantic_duplicate (near-verbatim pair)"):
+            return 1, 0
+        return 0, 0
+    if re.search(r"duplicat|identical", reason, re.IGNORECASE):
+        shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
+        if invalidate_memory(records[shorter_idx].id, reason=f"semantic_duplicate (judge reason: {reason[:80]})"):
+            return 1, 0
+        return 0, 0
+    fp = flag_fingerprint(pair_contents)
+    if fp in prev_flags:
+        return 0, 0
+    new_flags.add(fp)
+    problems.append(
+        f"LLM contradiction scan: stable-attribute conflict needs review — "
+        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
+    )
+    return 0, 1
+
+
+def _handle_invalidate_meta_records(records, pair):
+    """Handle an invalidate_meta pair using structured records. Returns invalidated count."""
+    invalidated = 0
+    for idx in pair:
+        if 0 <= idx < len(records) and META_MEMORY_RE.search(records[idx].content):
+            if invalidate_memory(records[idx].id, reason=META_NOISE_REASON):
+                invalidated += 1
+    return invalidated
+
+
+def _contradiction_scan_with_records(problems):
+    """Run contradiction scan using structured records (v2.3 path)."""
+    records, total_source, _ = memory_records.get_scan_batch()
+    if len(records) < 2:
+        return
+
+    candidates = memory_records.generate_candidate_pairs(records)
+    if not candidates:
+        return
+
+    safe_records = memory_records.prepare_for_judging(records)
+    contents = [r["content"] for r in safe_records]
+    contradictions = llm_judge.detect_contradictions(contents)
+
+    invalidated = 0
+    flagged = 0
+    seen_pairs = set()
+    prev_flags = load_flag_state()
+    new_flags = set()
+
+    for c in contradictions:
+        pair = c["pair"]
+        if not (0 <= pair[0] < len(records) and 0 <= pair[1] < len(records)):
+            continue
+        key = tuple(sorted(pair))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+
+        resolution = c.get("resolution", "flag_human")
+        reason = c.get("reason", "")
+
+        if resolution == "recency_wins":
+            inv, flg = _handle_recency_wins_records(records, pair, reason, prev_flags, new_flags, problems)
+            invalidated += inv
+            flagged += flg
+        elif resolution == "invalidate_meta":
+            invalidated += _handle_invalidate_meta_records(records, pair)
+        else:
+            inv, flg = _handle_stable_conflict_records(records, pair, reason, prev_flags, new_flags, problems)
+            invalidated += inv
+            flagged += flg
+
+    if invalidated > 0:
+        problems.append(
+            f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
+            f"(recency-wins, deterministic from timestamps)"
+        )
+    if new_flags:
+        save_flag_state(prev_flags | new_flags)
+
+
+def _handle_recency_wins_recall(memories, pair, reason, newer_idx):
+    """Handle a recency_wins pair using recall-based approach. Returns invalidated count."""
+    older_idx = pair[0] if pair[1] == newer_idx else pair[1]
+    if 0 <= older_idx < len(memories):
+        mid = memories[older_idx]["id"]
+        if invalidate_memory(mid, reason=f"superseded: {reason}"):
+            return 1
+    return 0
+
+
+def _handle_invalidate_meta_recall(memories, pair):
+    """Handle an invalidate_meta pair using recall-based approach. Returns invalidated count."""
+    invalidated = 0
+    for idx in pair:
+        if 0 <= idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]) and invalidate_memory(
+            memories[idx]["id"], reason=META_NOISE_REASON
+        ):
+            invalidated += 1
+    return invalidated
+
+
+def _handle_stable_conflict_recall(memories, pair, reason, contents, prev_flags, new_flags, problems):
+    """Handle a stable_conflict pair using recall-based approach. Returns (invalidated, flagged)."""
+    pair_contents = [contents[pair[0]], contents[pair[1]]]
+    a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
+    if a == b or a.startswith(b) or b.startswith(a):
+        shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
+        if invalidate_memory(memories[shorter_idx]["id"], reason="semantic_duplicate (near-verbatim pair)"):
+            return 1, 0
+        return 0, 0
+    if re.search(r"duplicat|identical", reason, re.IGNORECASE):
+        shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
+        if invalidate_memory(memories[shorter_idx]["id"], reason=f"semantic_duplicate (judge reason: {reason[:80]})"):
+            return 1, 0
+        return 0, 0
+    fp = flag_fingerprint(pair_contents)
+    if fp in prev_flags:
+        return 0, 0
+    new_flags.add(fp)
+    problems.append(
+        f"LLM contradiction scan: stable-attribute conflict needs review — "
+        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
+    )
+    return 0, 1
+
+
+def _contradiction_scan_with_recall(problems, memories):
+    """Run contradiction scan using recall-based approach (v2.0 fallback path)."""
+    if memories is None:
+        memories = recall_all_recent()
+    if len(memories) < 2:
+        return  # nothing to scan
+
+    contents = [m["content"] for m in memories]
+    contradictions = llm_judge.detect_contradictions(contents)
+
+    invalidated = 0
+    flagged = 0
+    seen_pairs = set()
+    prev_flags = load_flag_state()
+    new_flags = set()
+
+    for c in contradictions:
+        pair = c["pair"]
+        # v2.2.1: indices already validated by llm_judge, but double-check bounds
+        if not (0 <= pair[0] < len(memories) and 0 <= pair[1] < len(memories)):
+            continue
+        key = tuple(sorted(pair))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+
+        resolution = c.get("resolution", "flag_human")
+        reason = c.get("reason", "")
+        newer_idx = c.get("newer_index")
+
+        if resolution == "recency_wins" and newer_idx is not None:
+            invalidated += _handle_recency_wins_recall(memories, pair, reason, newer_idx)
+        elif resolution == "invalidate_meta":
+            invalidated += _handle_invalidate_meta_recall(memories, pair)
+        else:
+            inv, flg = _handle_stable_conflict_recall(memories, pair, reason, contents, prev_flags, new_flags, problems)
+            invalidated += inv
+            flagged += flg
+
+    if invalidated > 0:
+        problems.append(
+            f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
+            f"(recency-wins, non-destructive)"
+        )
+    if new_flags:
+        save_flag_state(prev_flags | new_flags)
 
 
 def llm_contradiction_scan(problems, memories=None):
@@ -688,199 +930,11 @@ def llm_contradiction_scan(problems, memories=None):
 
     # v2.3: use structured records for deterministic recency
     if memory_records is not None:
-        records, total_source, _ = memory_records.get_scan_batch()
-        if len(records) < 2:
-            return
-
-        # Generate cross-chunk candidates
-        candidates = memory_records.generate_candidate_pairs(records)
-        if not candidates:
-            return
-
-        # Prepare safe records for LLM
-        safe_records = memory_records.prepare_for_judging(records)
-        contents = [r["content"] for r in safe_records]
-        contradictions = llm_judge.detect_contradictions(contents)
-
-        invalidated = 0
-        flagged = 0
-        seen_pairs = set()
-        prev_flags = load_flag_state()
-        new_flags = set()
-
-        for c in contradictions:
-            pair = c["pair"]
-            if not (0 <= pair[0] < len(records) and 0 <= pair[1] < len(records)):
-                continue
-            key = tuple(sorted(pair))
-            if key in seen_pairs:
-                continue
-            seen_pairs.add(key)
-
-            resolution = c.get("resolution", "flag_human")
-            reason = c.get("reason", "")
-
-            # v2.3: deterministic recency resolution from timestamps
-            if resolution == "recency_wins":
-                rec_a = records[pair[0]]
-                rec_b = records[pair[1]]
-                newer, older = memory_records.resolve_recency((rec_a, rec_b))
-
-                if older is not None:
-                    # Deterministic recency — invalidate the older one
-                    if memory_records is not None:
-                        memory_records.append_audit_log(memory_records.AuditEntry(
-                            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-                            action="invalidate",
-                            memory_id=older.id,
-                            before_state={"state": older.state, "fact_type": older.fact_type},
-                            after_state={"state": "invalidated"},
-                            reason=f"superseded (deterministic recency): {reason}",
-                        ))
-                    if invalidate_memory(older.id, reason=f"superseded: {reason}"):
-                        invalidated += 1
-                else:
-                    # Missing/equal timestamps — can't determine recency, flag for human
-                    pair_contents = [rec_a.content, rec_b.content]
-                    fp = flag_fingerprint(pair_contents)
-                    if fp not in prev_flags:
-                        new_flags.add(fp)
-                        flagged += 1
-                        problems.append(
-                            f"LLM contradiction scan: state-change conflict but timestamps "
-                            f"missing/equal — needs manual recency check — "
-                            f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
-                        )
-
-            elif resolution == "invalidate_meta":
-                for idx in pair:
-                    if 0 <= idx < len(records) and META_MEMORY_RE.search(records[idx].content):
-                        if invalidate_memory(records[idx].id, reason="meta_noise: report about a past maintenance run"):
-                            invalidated += 1
-            else:
-                # Stable conflict — flag for human review
-                pair_contents = [records[pair[0]].content, records[pair[1]].content]
-                a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
-                if a == b or a.startswith(b) or b.startswith(a):
-                    shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
-                    if invalidate_memory(
-                        records[shorter_idx].id,
-                        reason="semantic_duplicate (near-verbatim pair)"
-                    ):
-                        invalidated += 1
-                    continue
-                if re.search(r"duplicat|identical", reason, re.IGNORECASE):
-                    shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
-                    if invalidate_memory(
-                        records[shorter_idx].id,
-                        reason=f"semantic_duplicate (judge reason: {reason[:80]})"
-                    ):
-                        invalidated += 1
-                    continue
-                fp = flag_fingerprint(pair_contents)
-                if fp in prev_flags:
-                    continue
-                new_flags.add(fp)
-                flagged += 1
-                problems.append(
-                    f"LLM contradiction scan: stable-attribute conflict needs review — "
-                    f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
-                )
-
-        if invalidated > 0:
-            problems.append(
-                f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
-                f"(recency-wins, deterministic from timestamps)"
-            )
-        if new_flags:
-            save_flag_state(prev_flags | new_flags)
+        _contradiction_scan_with_records(problems)
         return
 
     # Fallback: old recall-based approach (v2.0)
-    if memories is None:
-        memories = recall_all_recent()
-    if len(memories) < 2:
-        return  # nothing to scan
-
-    contents = [m["content"] for m in memories]
-    contradictions = llm_judge.detect_contradictions(contents)
-
-    invalidated = 0
-    flagged = 0
-    seen_pairs = set()
-    prev_flags = load_flag_state()
-    new_flags = set()
-
-    for c in contradictions:
-        pair = c["pair"]
-        # v2.2.1: indices already validated by llm_judge, but double-check bounds
-        if not (0 <= pair[0] < len(memories) and 0 <= pair[1] < len(memories)):
-            continue
-        # Normalize unordered pair; skip if already handled this run
-        key = tuple(sorted(pair))
-        if key in seen_pairs:
-            continue
-        seen_pairs.add(key)
-
-        resolution = c.get("resolution", "flag_human")
-        reason = c.get("reason", "")
-        newer_idx = c.get("newer_index")
-
-        if resolution == "recency_wins" and newer_idx is not None:
-            # Invalidate the OLDER entry (the one that's NOT newer_idx)
-            older_idx = pair[0] if pair[1] == newer_idx else pair[1]
-            if 0 <= older_idx < len(memories):
-                mid = memories[older_idx]["id"]
-                if invalidate_memory(mid, reason=f"superseded: {reason}"):
-                    invalidated += 1
-        elif resolution == "invalidate_meta":
-            # The entry itself is a report about a past run — invalidate it
-            for idx in pair:
-                if 0 <= idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]) and invalidate_memory(
-                    memories[idx]["id"], reason="meta_noise: report about a past maintenance run"
-                ):
-                    invalidated += 1
-        else:
-            # Stable conflict — flag for human review (don't auto-resolve).
-            # Guard 1: identical/near-identical contents are duplicates, not
-            # conflicts — the judge occasionally mislabels them (observed live).
-            pair_contents = [contents[pair[0]], contents[pair[1]]]
-            a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
-            # Guard 2: one content a prefix/subset of the other = same fact with
-            # extra metadata — resolve as dedup (invalidate the shorter), not a flag.
-            if a == b or a.startswith(b) or b.startswith(a):
-                shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
-                if invalidate_memory(memories[shorter_idx]["id"], reason="semantic_duplicate (near-verbatim pair)"):
-                    invalidated += 1
-                continue
-            # Guard 3: judge's own reason says duplicate — trust the diagnosis
-            # over the type label and resolve as dedup.
-            if re.search(r"duplicat|identical", reason, re.IGNORECASE):
-                shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
-                if invalidate_memory(
-                    memories[shorter_idx]["id"],
-                    reason=f"semantic_duplicate (judge reason: {reason[:80]})"
-                ):
-                    invalidated += 1
-                continue
-            # Cross-run dedup: only report pairs not already flagged before.
-            fp = flag_fingerprint(pair_contents)
-            if fp in prev_flags:
-                continue  # already reported in a previous run — stay silent
-            new_flags.add(fp)
-            flagged += 1
-            problems.append(
-                f"LLM contradiction scan: stable-attribute conflict needs review — "
-                f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
-            )
-
-    if invalidated > 0:
-        problems.append(
-            f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
-            f"(recency-wins, non-destructive)"
-        )
-    if new_flags:
-        save_flag_state(prev_flags | new_flags)
+    _contradiction_scan_with_recall(problems, memories)
 
 
 def _restore_memory(memory_id: str):
@@ -906,7 +960,7 @@ def _restore_memory(memory_id: str):
         print(f"Memory {memory_id[:12]}... restored to valid state.")
         if memory_records is not None:
             memory_records.append_audit_log(memory_records.AuditEntry(
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                timestamp=time.strftime(ISO_TIMESTAMP_FMT, time.gmtime()),
                 action="restore",
                 memory_id=memory_id,
                 after_state={"state": "valid"},
@@ -931,46 +985,8 @@ def _print_audit_log():
               f"{e.get('memory_id', '')[:12]}... | {e.get('reason', '')[:60]}")
 
 
-def main():
-    global ALLOW_DESTRUCTIVE
-
-    # v2.2.1: parse CLI args
-    # v2.4: added --apply and --restore modes
-    parser = argparse.ArgumentParser(description="Daily memory optimization")
-    parser.add_argument("--allow-destructive", action="store_true",
-                        help="Enable LLM auto-mutation (invalidate, config_tune). "
-                             "Default: disabled — LLM is advisor only.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Report issues without taking any action.")
-    parser.add_argument("--apply", action="store_true",
-                        help="Apply all recommended actions (implies --allow-destructive). "
-                             "Use --dry-run first to preview.")
-    parser.add_argument("--restore", type=str, metavar="AUDIT_ID",
-                        help="Restore a previously invalidated memory from the audit log. "
-                             "Pass the memory_id from the audit log entry.")
-    parser.add_argument("--audit-log", action="store_true",
-                        help="Print recent audit log entries and exit.")
-    args = parser.parse_args()
-
-    # --apply implies --allow-destructive
-    if args.apply:
-        ALLOW_DESTRUCTIVE = True
-    else:
-        ALLOW_DESTRUCTIVE = args.allow_destructive
-
-    # --restore: re-validate a previously invalidated memory
-    if args.restore:
-        _restore_memory(args.restore)
-        return
-
-    # --audit-log: print recent entries and exit
-    if args.audit_log:
-        _print_audit_log()
-        return
-
-    problems = []
-
-    # --- 1. Trigger consolidation -------------------------------------
+def _run_consolidation(args, problems):
+    """Steps 1-2: Trigger consolidation and poll for completion."""
     op_id = None
     if not args.dry_run:
         try:
@@ -983,7 +999,6 @@ def main():
     else:
         problems.append("[dry-run] Consolidation skipped")
 
-    # --- 2. Poll operation until terminal state ------------------------
     final = None
     if op_id:
         deadline = time.time() + POLL_DEADLINE
@@ -1002,7 +1017,11 @@ def main():
             problems.append(f"Consolidation op {op_id[:8]} did not finish within {POLL_DEADLINE}s")
         elif final.get("status") != "completed":
             problems.append(f"Consolidation op {op_id[:8]} ended with status={final.get('status')}")
+    return final
 
+
+def _run_smoke_tests(args, problems, final):
+    """Steps 3 + 3b: Recall and retain smoke-tests."""
     # --- 3. Recall smoke-test (consolidation over-prune check) ----------
     if final is not None and final.get("status") == "completed":
         try:
@@ -1036,7 +1055,9 @@ def main():
         except Exception as e:
             problems.append(f"Retain smoke-test failed: {type(e).__name__}: {e}")
 
-    # --- 4. Bank stats + failed_operations trend -----------------------
+
+def _check_bank_stats(problems):
+    """Step 4: Bank stats + failed_operations trend."""
     try:
         _, stats = http("GET", f"/v1/default/banks/{BANK}/stats", timeout=120)
         nodes = stats.get("total_nodes", 0)
@@ -1057,7 +1078,9 @@ def main():
     except Exception as e:
         problems.append(f"Bank stats fetch failed: {type(e).__name__}: {e}")
 
-    # --- 5. LLM dedup + contradiction passes (v2.0, restructured v2.0.1) -
+
+def _run_llm_passes(args, problems):
+    """Step 5: LLM dedup + contradiction passes."""
     if not args.dry_run:
         try:
             cleanup_smoke_tests(problems)
@@ -1074,7 +1097,9 @@ def main():
         except Exception as e:
             problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
 
-    # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) -------------
+
+def _check_knowledge_pages(problems):
+    """Step 7: Knowledge Pages health (Hindsight >= 0.9 only)."""
     # v2.3: Version-gate the is_stale behavior. Per current Hindsight docs
     # (v0.9.1+), tree is_stale is scope-aware (only marks stale when a
     # memory in that page's tags+fact-type scope has been written since
@@ -1120,7 +1145,9 @@ def main():
     except Exception as e:
         problems.append(f"Knowledge Pages check failed: {type(e).__name__}: {e}")
 
-    # --- 7b. L3 wiki lint-lite ------------------------------------------
+
+def _check_l3_wiki(problems):
+    """Step 7b: L3 wiki lint-lite."""
     try:
         if KB_DIR.exists():
             md_files = [p for p in KB_DIR.rglob("*.md") if "_archive" not in p.parts]
@@ -1137,7 +1164,9 @@ def main():
     except Exception as e:
         problems.append(f"L3 wiki check failed: {type(e).__name__}: {e}")
 
-    # --- 8. Local memory capacity check --------------------------------
+
+def _check_local_memory(args, problems):
+    """Step 8: Local memory capacity check."""
     # v2.2.1: use decoded char count, not st_size bytes
     try:
         if MEM_FILE.exists():
@@ -1145,31 +1174,7 @@ def main():
             n = len(content)
             pct = n / MEM_CAP
             if pct >= OFFLOAD_AT:
-                if memory_offload is None:
-                    problems.append(
-                        f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                        "memory_offload.py not found next to this script; offload skipped"
-                    )
-                elif not args.dry_run:
-                    try:
-                        used_before, _ = memory_offload.get_memory_usage()
-                        memory_offload.main()
-                        used_after, _ = memory_offload.get_memory_usage()
-                        if used_after < used_before:
-                            problems.append(
-                                f"MEMORY.md was at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                                f"offloaded to Hindsight, now {used_after}/{MEM_CAP} chars"
-                            )
-                        else:
-                            problems.append(
-                                f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                                f"offload ran but no entries moved (all essential?). Prune manually."
-                            )
-                    except Exception as e:
-                        problems.append(
-                            f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                            f"offload failed: {type(e).__name__}: {e}"
-                        )
+                _handle_memory_offload(args, problems, n, pct)
             elif pct >= MEM_WARN:
                 problems.append(f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — approaching capacity")
         if USER_FILE.exists():
@@ -1181,48 +1186,144 @@ def main():
     except Exception as e:
         problems.append(f"Local memory check failed: {type(e).__name__}: {e}")
 
+
+def _handle_memory_offload(args, problems, n, pct):
+    """Handle memory offload when MEMORY.md is over capacity."""
+    if memory_offload is None:
+        problems.append(
+            f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+            "memory_offload.py not found next to this script; offload skipped"
+        )
+    elif not args.dry_run:
+        try:
+            used_before, _ = memory_offload.get_memory_usage()
+            memory_offload.main()
+            used_after, _ = memory_offload.get_memory_usage()
+            if used_after < used_before:
+                problems.append(
+                    f"MEMORY.md was at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                    f"offloaded to Hindsight, now {used_after}/{MEM_CAP} chars"
+                )
+            else:
+                problems.append(
+                    f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                    f"offload ran but no entries moved (all essential?). Prune manually."
+                )
+        except Exception as e:
+            problems.append(
+                f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                f"offload failed: {type(e).__name__}: {e}"
+            )
+
+
+def _output_results(args, problems):
+    """Step 9: Output: LLM auto-resolve → Telegram fallback."""
+    if not problems:
+        return  # empty stdout -> cron stays silent
+
+    # Step 9a: attempt LLM auto-resolution
+    resolved, unresolved = try_resolve_issues_with_llm(problems)
+
+    # Step 9b: build output report
+    if resolved:
+        print("**🧠 Daily Memory Optimization — issues auto-resolved**\n")
+        for r in resolved:
+            print(f"  ✅ {r}")
+
+    if unresolved:
+        # Step 9c: notify user via Telegram DM for remaining issues
+        # v2.2.1: escape HTML in issue text to prevent Telegram parse errors
+        timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        tg_text = (
+            f"<b>🧠 Daily Memory Optimization</b>\n"
+            f"<i>{timestamp}</i>\n\n"
+            f"<b>{len(unresolved)} issue(s) need your attention "
+            f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
+        )
+        for u in unresolved:
+            tg_text += f"  • {_escape_html(u)}\n"
+
+        # v2.2.1: check return value and report delivery status accurately
+        tg_sent = send_telegram_notification(tg_text)
+        delivery_status = (
+            "Telegram DM sent" if tg_sent
+            else "Telegram DM delivery FAILED (check bot token / chat ID)"
+        )
+
+        # Also print to stdout (for cron log visibility)
+        mode = (
+            "dry-run" if args.dry_run
+            else ("apply" if args.apply
+            else ("destructive" if ALLOW_DESTRUCTIVE
+            else "safe"))
+        )
+        print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
+        for u in unresolved:
+            print(f"  ⚠️ {u}")
+
+
+def main():
+    global ALLOW_DESTRUCTIVE
+
+    # v2.2.1: parse CLI args
+    # v2.4: added --apply and --restore modes
+    parser = argparse.ArgumentParser(description="Daily memory optimization")
+    parser.add_argument("--allow-destructive", action="store_true",
+                        help="Enable LLM auto-mutation (invalidate, config_tune). "
+                             "Default: disabled — LLM is advisor only.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Report issues without taking any action.")
+    parser.add_argument("--apply", action="store_true",
+                        help="Apply all recommended actions (implies --allow-destructive). "
+                             "Use --dry-run first to preview.")
+    parser.add_argument("--restore", type=str, metavar="AUDIT_ID",
+                        help="Restore a previously invalidated memory from the audit log. "
+                             "Pass the memory_id from the audit log entry.")
+    parser.add_argument("--audit-log", action="store_true",
+                        help="Print recent audit log entries and exit.")
+    args = parser.parse_args()
+
+    # --apply implies --allow-destructive
+    if args.apply:
+        ALLOW_DESTRUCTIVE = True
+    else:
+        ALLOW_DESTRUCTIVE = args.allow_destructive
+
+    # --restore: re-validate a previously invalidated memory
+    if args.restore:
+        _restore_memory(args.restore)
+        return
+
+    # --audit-log: print recent entries and exit
+    if args.audit_log:
+        _print_audit_log()
+        return
+
+    problems = []
+
+    # --- 1-2. Trigger consolidation + poll -------------------------------
+    final = _run_consolidation(args, problems)
+
+    # --- 3 + 3b. Smoke tests ---------------------------------------------
+    _run_smoke_tests(args, problems, final)
+
+    # --- 4. Bank stats + failed_operations trend -------------------------
+    _check_bank_stats(problems)
+
+    # --- 5. LLM dedup + contradiction passes (v2.0, restructured v2.0.1) -
+    _run_llm_passes(args, problems)
+
+    # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) ---------------
+    _check_knowledge_pages(problems)
+
+    # --- 7b. L3 wiki lint-lite ------------------------------------------
+    _check_l3_wiki(problems)
+
+    # --- 8. Local memory capacity check --------------------------------
+    _check_local_memory(args, problems)
+
     # --- 9. Output: LLM auto-resolve → Telegram fallback -----------------
-    if problems:
-        # Step 9a: attempt LLM auto-resolution
-        resolved, unresolved = try_resolve_issues_with_llm(problems)
-
-        # Step 9b: build output report
-        if resolved:
-            print("**🧠 Daily Memory Optimization — issues auto-resolved**\n")
-            for r in resolved:
-                print(f"  ✅ {r}")
-
-        if unresolved:
-            # Step 9c: notify user via Telegram DM for remaining issues
-            # v2.2.1: escape HTML in issue text to prevent Telegram parse errors
-            timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-            tg_text = (
-                f"<b>🧠 Daily Memory Optimization</b>\n"
-                f"<i>{timestamp}</i>\n\n"
-                f"<b>{len(unresolved)} issue(s) need your attention "
-                f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
-            )
-            for u in unresolved:
-                tg_text += f"  • {_escape_html(u)}\n"
-
-            # v2.2.1: check return value and report delivery status accurately
-            tg_sent = send_telegram_notification(tg_text)
-            delivery_status = (
-                "Telegram DM sent" if tg_sent
-                else "Telegram DM delivery FAILED (check bot token / chat ID)"
-            )
-
-            # Also print to stdout (for cron log visibility)
-            mode = (
-                "dry-run" if args.dry_run
-                else ("apply" if args.apply
-                else ("destructive" if ALLOW_DESTRUCTIVE
-                else "safe"))
-            )
-            print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
-            for u in unresolved:
-                print(f"  ⚠️ {u}")
-    # else: empty stdout -> cron stays silent
+    _output_results(args, problems)
 
 
 if __name__ == "__main__":

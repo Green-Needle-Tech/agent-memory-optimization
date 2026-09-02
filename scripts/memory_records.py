@@ -16,6 +16,7 @@ v2.4 additions:
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -210,6 +211,43 @@ def get_scan_batch(max_records: int = MAX_SCAN_PER_RUN) -> tuple[list[MemoryReco
 
 # === Cross-chunk candidate generation ===
 
+def _extract_keywords(rec: MemoryRecord) -> set[str]:
+    """Extract keywords from a record's tags and content for entity blocking."""
+    keywords = set()
+    for tag in rec.tags:
+        if not tag.startswith(("parent:", "session:")):
+            keywords.add(tag.lower())
+    words = re.findall(r'\b[A-Z][a-z]+\b', rec.content)
+    keywords.update(w.lower() for w in words if len(w) > 3)
+    return keywords
+
+
+def _build_entity_blocks(records: list[MemoryRecord]) -> dict[str, list[int]]:
+    """Build entity-based blocking index from records."""
+    entity_blocks: dict[str, list[int]] = {}
+    for i, rec in enumerate(records):
+        for kw in _extract_keywords(rec):
+            entity_blocks.setdefault(kw, []).append(i)
+    return entity_blocks
+
+
+def _content_similarity_candidates(records: list[MemoryRecord]) -> set[tuple[int, int]]:
+    """Generate candidates based on content keyword overlap > 40%."""
+    candidates: set[tuple[int, int]] = set()
+    contents_normalized = [_normalize(rec.content) for rec in records]
+    word_sets = [set(c.split()) for c in contents_normalized]
+    for i in range(len(records)):
+        if not word_sets[i]:
+            continue
+        for j in range(i + 1, len(records)):
+            if not word_sets[j]:
+                continue
+            overlap = len(word_sets[i] & word_sets[j]) / max(len(word_sets[i]), 1)
+            if overlap > 0.4:
+                candidates.add((i, j))
+    return candidates
+
+
 def generate_candidate_pairs(records: list[MemoryRecord]) -> list[tuple[int, int]]:
     """Generate candidate pairs for dedup/contradiction checking.
 
@@ -225,23 +263,10 @@ def generate_candidate_pairs(records: list[MemoryRecord]) -> list[tuple[int, int
     The LLM is then asked only to classify these pre-filtered candidates,
     not to scan everything — reducing LLM calls dramatically.
     """
-    candidates = set()
+    candidates: set[tuple[int, int]] = set()
 
     # 1. Entity-based blocking
-    entity_blocks: dict[str, list[int]] = {}
-    for i, rec in enumerate(records):
-        # Extract entities from tags and content keywords
-        keywords = set()
-        for tag in rec.tags:
-            if not tag.startswith(("parent:", "session:")):
-                keywords.add(tag.lower())
-        # Simple keyword extraction from content
-        words = re.findall(r'\b[A-Z][a-z]+\b', rec.content)
-        keywords.update(w.lower() for w in words if len(w) > 3)
-
-        for kw in keywords:
-            entity_blocks.setdefault(kw, []).append(i)
-
+    entity_blocks = _build_entity_blocks(records)
     for indices in entity_blocks.values():
         if len(indices) < 2:
             continue
@@ -250,17 +275,7 @@ def generate_candidate_pairs(records: list[MemoryRecord]) -> list[tuple[int, int
                 candidates.add((indices[a], indices[b]))
 
     # 2. Content similarity blocking (normalized keyword overlap > 40%)
-    contents_normalized = [_normalize(rec.content) for rec in records]
-    word_sets = [set(c.split()) for c in contents_normalized]
-    for i in range(len(records)):
-        if not word_sets[i]:
-            continue
-        for j in range(i + 1, len(records)):
-            if not word_sets[j]:
-                continue
-            overlap = len(word_sets[i] & word_sets[j]) / max(len(word_sets[i]), 1)
-            if overlap > 0.4:
-                candidates.add((i, j))
+    candidates |= _content_similarity_candidates(records)
 
     # 3. Adjacent records (catches near-duplicates in ingest order)
     for i in range(len(records) - 1):
@@ -330,10 +345,13 @@ def append_audit_log(entry: AuditEntry) -> None:
     try:
         lines = AUDIT_LOG_FILE.read_text(encoding="utf-8").strip().split("\n")
         if len(lines) > AUDIT_MAX_ENTRIES:
-            AUDIT_LOG_FILE.write_text(
-                "\n".join(lines[-AUDIT_MAX_ENTRIES:]) + "\n",
-                encoding="utf-8"
-            )
+            rotated = "\n".join(lines[-AUDIT_MAX_ENTRIES:]) + "\n"
+            fd, tmp = tempfile.mkstemp(dir=str(AUDIT_LOG_FILE.parent), prefix=".audit_rot_", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(rotated)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(AUDIT_LOG_FILE))
     except Exception:  # noqa: S110 - best-effort rotation, never block
         pass
 

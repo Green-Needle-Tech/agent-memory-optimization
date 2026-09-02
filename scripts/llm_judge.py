@@ -413,6 +413,22 @@ def _fallback_classify(entries):
     return essential, offloadable
 
 
+def _fallback_dedup_inner_loop(entry_a: str, i: int, entries: list, used: set) -> list:
+    """Find duplicates of entry_a in entries[i+1:]. Returns list of duplicate indices."""
+    group = []
+    words_a = set(entry_a.lower().split())
+    for j in range(i + 1, len(entries)):
+        if j in used:
+            continue
+        words_b = set(entries[j].lower().split())
+        if words_a and words_b:
+            overlap = len(words_a & words_b) / len(words_a)
+            if overlap > 0.6:
+                group.append(j)
+                used.add(j)
+    return group
+
+
 def _fallback_dedup(entries):
     """Rule-based semantic dedup (word overlap >60%)."""
     groups = []
@@ -420,18 +436,8 @@ def _fallback_dedup(entries):
     for i, entry_a in enumerate(entries):
         if i in used:
             continue
-        group = [i]
         used.add(i)
-        words_a = set(entry_a.lower().split())
-        for j in range(i + 1, len(entries)):
-            if j in used:
-                continue
-            words_b = set(entries[j].lower().split())
-            if words_a and words_b:
-                overlap = len(words_a & words_b) / len(words_a)
-                if overlap > 0.6:
-                    group.append(j)
-                    used.add(j)
+        group = [i] + _fallback_dedup_inner_loop(entry_a, i, entries, used)
         if len(group) > 1:
             groups.append({"canonical": group[0], "duplicates": group[1:]})
     return groups
@@ -527,6 +533,42 @@ def classify_importance(entries, context="L1 local memory for a Hermes AI agent"
     return essential, offloadable
 
 
+def _process_dedup_chunk(chunk: list, offset: int, n_chunk: int) -> list:
+    """Process a single chunk for semantic dedup. Returns list of groups with global indices."""
+    numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
+    prompt = (
+        f"You are a semantic deduplication judge for AI agent memory.\n"
+        f"Identify groups of entries that express the SAME underlying fact or preference.\n"
+        f"This includes verbatim or near-verbatim copies, and same fact with different wording\n"
+        f"(e.g., \"User prefers Python\" vs \"User's primary language is Python\"). Only group\n"
+        f"genuine duplicates — not entries that merely share a topic.\n\n"
+        f"Entries:\n{numbered}\n\n"
+        f"Respond with ONLY a JSON array of groups: "
+        f"[{{\"canonical\": idx, \"duplicates\": [idx, ...]}}, ...]\n"
+        f"Each group must have exactly one canonical (the best-worded entry) and at least one duplicate.\n"
+        f"If no duplicates exist, respond with: []\n"
+        f"Do not include any prose or markdown."
+    )
+
+    resp = _llm_chat([{"role": "user", "content": prompt}])
+    parsed = _parse_json_response(resp)
+
+    if parsed is not None and isinstance(parsed, list):
+        # v2.2.1: strict validation of all groups
+        validated = _validate_dedup_groups(parsed, n_chunk)
+        if validated is not None:
+            return [{"canonical": offset + g["canonical"],
+                     "duplicates": [offset + d for d in g["duplicates"]]} for g in validated]
+    # Fallback for this chunk: word-overlap
+    return _fallback_dedup_to_groups(chunk, offset)
+
+
+def _fallback_dedup_to_groups(chunk: list, offset: int) -> list:
+    """Run fallback dedup on a chunk and adjust indices to global."""
+    return [{"canonical": offset + g["canonical"],
+             "duplicates": [offset + d for d in g["duplicates"]]} for g in _fallback_dedup(chunk)]
+
+
 def semantic_dedup(entries):
     """Find semantic near-duplicates using LLM judge.
 
@@ -551,50 +593,72 @@ def semantic_dedup(entries):
 
     groups = []
     for offset, chunk in _chunk(entries):
-        n_chunk = len(chunk)
-        numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
-        prompt = (
-            f"You are a semantic deduplication judge for AI agent memory.\n"
-            f"Identify groups of entries that express the SAME underlying fact or preference.\n"
-            f"This includes verbatim or near-verbatim copies, and same fact with different wording\n"
-            f"(e.g., \"User prefers Python\" vs \"User's primary language is Python\"). Only group\n"
-            f"genuine duplicates — not entries that merely share a topic.\n\n"
-            f"Entries:\n{numbered}\n\n"
-            f"Respond with ONLY a JSON array of groups: "
-            f"[{{\"canonical\": idx, \"duplicates\": [idx, ...]}}, ...]\n"
-            f"Each group must have exactly one canonical (the best-worded entry) and at least one duplicate.\n"
-            f"If no duplicates exist, respond with: []\n"
-            f"Do not include any prose or markdown."
-        )
-
-        resp = _llm_chat([{"role": "user", "content": prompt}])
-        parsed = _parse_json_response(resp)
-
-        if parsed is not None and isinstance(parsed, list):
-            # v2.2.1: strict validation of all groups
-            validated = _validate_dedup_groups(parsed, n_chunk)
-            if validated is not None:
-                for g in validated:
-                    groups.append({
-                        "canonical": offset + g["canonical"],
-                        "duplicates": [offset + d for d in g["duplicates"]],
-                    })
-            else:
-                # Invalid response — fallback for this chunk
-                for g in _fallback_dedup(chunk):
-                    groups.append({
-                        "canonical": offset + g["canonical"],
-                        "duplicates": [offset + d for d in g["duplicates"]],
-                    })
-        else:
-            # Fallback for this chunk: word-overlap
-            for g in _fallback_dedup(chunk):
-                groups.append({
-                    "canonical": offset + g["canonical"],
-                    "duplicates": [offset + d for d in g["duplicates"]],
-                })
-
+        groups.extend(_process_dedup_chunk(chunk, offset, len(chunk)))
     return groups
+
+
+def _process_contradiction_chunk(chunk: list, offset: int, n_chunk: int) -> list:
+    """Process a single chunk for contradiction detection. Returns contradictions with global indices."""
+    numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
+    prompt = (
+        f"You are a contradiction detector for AI agent memory.\n"
+        f"Find pairs of entries that genuinely contradict each other: both assert the SAME\n"
+        f"predicate about the same subject, and both cannot be true at once.\n\n"
+        f"NOT contradictions (do not report these):\n"
+        f"  - Complementary facts: one entry states a POLICY or preference (\"preferred method\n"
+        f"    is X\"), the other states a CAPABILITY or constraint (\"the agent cannot auto-edit\n"
+        f"    config files\"). Different predicates — both can be true.\n"
+        f"  - Different scope or aspect of the same system (e.g. one about the reload endpoint,\n"
+        f"    another about the file watcher).\n"
+        f"  - Entries that merely share a topic or entity name.\n"
+        f"  - Duplicates or near-identical entries (same fact, same claim): duplicates are NOT\n"
+        f"    contradictions — leave them to the dedup pass. Never report them here.\n"
+        f"  - A report ABOUT a past conflict/dedup run (\"a conflict was flagged regarding X\")\n"
+        f"    vs any other entry — that is meta-noise, not a fact about the world.\n\n"
+        f"Two contradiction types:\n"
+        f"  - 'state_change': the newer entry supersedes the old (provider switched, URL changed,\n"
+        f"    version upgraded, feature that 'was never read' now works). Temporal markers\n"
+        f"    (\"now\", \"no longer\", \"was upgraded\", \"as of <date>\", \"completed on <date>\")\n"
+        f"    usually indicate this. Resolution: 'recency_wins' (invalidate the older entry).\n"
+        f"  - 'stable_conflict': both entries claim different stable attributes for the same\n"
+        f"    entity, with no temporal ordering. Resolution: 'flag_human'.\n"
+        f"  - 'meta_noise': one entry is itself a report about a past conflict/dedup run\n"
+        f"    (\"a conflict was flagged...\", \"N duplicates were invalidated...\"). Resolution:\n"
+        f"    'invalidate_meta' (the report is stale bookkeeping, not a fact).\n\n"
+        f"Entries:\n{numbered}\n\n"
+        f"Respond with ONLY a JSON array: "
+        f"[{{\"pair\": [i, j], \"type\": \"state_change|stable_conflict|meta_noise\", "
+        f"\"resolution\": \"recency_wins|flag_human|invalidate_meta\", \"reason\": \"brief explanation\", "
+        f"\"newer_index\": i_or_j}}, ...]\n"
+        f"Rules: report each unordered pair at most once; prefer the single clearest type per pair;\n"
+        f"if no contradictions exist, respond with: []\n"
+        f"Do not include any prose or markdown."
+    )
+
+    resp = _llm_chat([{"role": "user", "content": prompt}])
+    parsed = _parse_json_response(resp)
+
+    if parsed is not None and isinstance(parsed, list):
+        # v2.2.1: strict validation of all contradiction entries
+        validated = _validate_contradictions(parsed, n_chunk)
+        if validated is not None:
+            return _contradictions_with_offset(validated, offset)
+    # Fallback for this chunk: keyword-based
+    return _fallback_contradictions(chunk)
+
+
+def _contradictions_with_offset(validated: list, offset: int) -> list:
+    """Adjust validated contradiction indices to global."""
+    result = []
+    for c in validated:
+        result.append({
+            "pair": [offset + c["pair"][0], offset + c["pair"][1]],
+            "type": c["type"],
+            "resolution": c["resolution"],
+            "reason": c["reason"],
+            "newer_index": offset + c["newer_index"] if c["newer_index"] is not None else None,
+        })
+    return result
 
 
 def detect_contradictions(entries):
@@ -631,65 +695,7 @@ def detect_contradictions(entries):
 
     contradictions = []
     for offset, chunk in _chunk(entries):
-        n_chunk = len(chunk)
-        numbered = "\n".join(f"[{offset + k}] {e}" for k, e in enumerate(chunk))
-        prompt = (
-            f"You are a contradiction detector for AI agent memory.\n"
-            f"Find pairs of entries that genuinely contradict each other: both assert the SAME\n"
-            f"predicate about the same subject, and both cannot be true at once.\n\n"
-            f"NOT contradictions (do not report these):\n"
-            f"  - Complementary facts: one entry states a POLICY or preference (\"preferred method\n"
-            f"    is X\"), the other states a CAPABILITY or constraint (\"the agent cannot auto-edit\n"
-            f"    config files\"). Different predicates — both can be true.\n"
-            f"  - Different scope or aspect of the same system (e.g. one about the reload endpoint,\n"
-            f"    another about the file watcher).\n"
-            f"  - Entries that merely share a topic or entity name.\n"
-            f"  - Duplicates or near-identical entries (same fact, same claim): duplicates are NOT\n"
-            f"    contradictions — leave them to the dedup pass. Never report them here.\n"
-            f"  - A report ABOUT a past conflict/dedup run (\"a conflict was flagged regarding X\")\n"
-            f"    vs any other entry — that is meta-noise, not a fact about the world.\n\n"
-            f"Two contradiction types:\n"
-            f"  - 'state_change': the newer entry supersedes the old (provider switched, URL changed,\n"
-            f"    version upgraded, feature that 'was never read' now works). Temporal markers\n"
-            f"    (\"now\", \"no longer\", \"was upgraded\", \"as of <date>\", \"completed on <date>\")\n"
-            f"    usually indicate this. Resolution: 'recency_wins' (invalidate the older entry).\n"
-            f"  - 'stable_conflict': both entries claim different stable attributes for the same\n"
-            f"    entity, with no temporal ordering. Resolution: 'flag_human'.\n"
-            f"  - 'meta_noise': one entry is itself a report about a past conflict/dedup run\n"
-            f"    (\"a conflict was flagged...\", \"N duplicates were invalidated...\"). Resolution:\n"
-            f"    'invalidate_meta' (the report is stale bookkeeping, not a fact).\n\n"
-            f"Entries:\n{numbered}\n\n"
-            f"Respond with ONLY a JSON array: "
-            f"[{{\"pair\": [i, j], \"type\": \"state_change|stable_conflict|meta_noise\", "
-            f"\"resolution\": \"recency_wins|flag_human|invalidate_meta\", \"reason\": \"brief explanation\", "
-            f"\"newer_index\": i_or_j}}, ...]\n"
-            f"Rules: report each unordered pair at most once; prefer the single clearest type per pair;\n"
-            f"if no contradictions exist, respond with: []\n"
-            f"Do not include any prose or markdown."
-        )
-
-        resp = _llm_chat([{"role": "user", "content": prompt}])
-        parsed = _parse_json_response(resp)
-
-        if parsed is not None and isinstance(parsed, list):
-            # v2.2.1: strict validation of all contradiction entries
-            validated = _validate_contradictions(parsed, n_chunk)
-            if validated is not None:
-                for c in validated:
-                    contradictions.append({
-                        "pair": [offset + c["pair"][0], offset + c["pair"][1]],
-                        "type": c["type"],
-                        "resolution": c["resolution"],
-                        "reason": c["reason"],
-                        "newer_index": offset + c["newer_index"] if c["newer_index"] is not None else None,
-                    })
-            else:
-                # Invalid response — fallback for this chunk
-                contradictions.extend(_fallback_contradictions(chunk))
-        else:
-            # Fallback for this chunk: keyword-based
-            contradictions.extend(_fallback_contradictions(chunk))
-
+        contradictions.extend(_process_contradiction_chunk(chunk, offset, len(chunk)))
     return contradictions
 
 

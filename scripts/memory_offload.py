@@ -227,6 +227,16 @@ def hindsight_health_check():
         return False
 
 
+def _check_word_overlap(content: str, result_text: str, threshold: float = 0.6) -> bool:
+    """Check if two texts have word overlap above threshold."""
+    entry_words = set(content.lower().split())
+    result_words = set(result_text.lower().split())
+    if entry_words and result_words:
+        overlap = len(entry_words & result_words) / len(entry_words)
+        return overlap > threshold
+    return False
+
+
 def hindsight_recall_check(content):
     """Semantic recall to check if content is already in Hindsight (dedup).
 
@@ -253,27 +263,27 @@ def hindsight_recall_check(content):
                 return False
             # Use LLM judge for semantic dedup if available
             if llm_judge is not None:
-                result_texts = [r.get("content", "") or r.get("text", "") for r in results]
-                # Batch: check all recalled results against the entry in one LLM call
-                dup_groups = llm_judge.semantic_dedup([content, *result_texts[:5]])
-                for g in dup_groups:
-                    # v2.2.1: entry (index 0) is a duplicate if it's the canonical
-                    # OR appears in the duplicates list
-                    if g["canonical"] == 0 or 0 in g["duplicates"]:
-                        return True  # entry is already represented in Hindsight
-                return False
+                return _llm_dedup_check(content, results)
             # Fallback: word overlap
             for r in results:
                 result_text = r.get("content", "") or r.get("text", "")
-                entry_words = set(content.lower().split())
-                result_words = set(result_text.lower().split())
-                if entry_words and result_words:
-                    overlap = len(entry_words & result_words) / len(entry_words)
-                    if overlap > 0.6:
-                        return True
+                if _check_word_overlap(content, result_text):
+                    return True
             return False
     except Exception:
         return False  # If recall fails, proceed with retain anyway
+
+
+def _llm_dedup_check(content: str, results: list) -> bool:
+    """Check if content is a duplicate using LLM semantic dedup."""
+    result_texts = [r.get("content", "") or r.get("text", "") for r in results]
+    dup_groups = llm_judge.semantic_dedup([content, *result_texts[:5]])
+    for g in dup_groups:
+        # v2.2.1: entry (index 0) is a duplicate if it's the canonical
+        # OR appears in the duplicates list
+        if g["canonical"] == 0 or 0 in g["duplicates"]:
+            return True  # entry is already represented in Hindsight
+    return False
 
 
 def hindsight_retain(content, tags=None):
@@ -352,7 +362,28 @@ def main():
         _do_offload()
 
 
+def _offload_entry(entry, tags):
+    """Offload a single entry to Hindsight. Returns True if safely offloaded."""
+    try:
+        # Dedup check — skip if already in Hindsight (LLM semantic or word-overlap)
+        if hindsight_recall_check(entry):
+            return True  # Already in L2 — safe to remove from L1
+        success = hindsight_retain(entry, tags)
+        return success
+    except Exception:
+        return False
+
+
 def _do_offload():
+    """Offload non-essential memory entries to Hindsight.
+
+    Safety invariant (v2.2.1):
+        An entry may be removed from L1 only after durable L2 retention
+        or verified existing L2 presence. Failed entries are ALWAYS kept.
+
+    The file lock prevents concurrent execution by the 30-min offload cron
+    and the daily optimization job.
+    """
     # 1. Check Hindsight health
     if not hindsight_health_check():
         print("WARN: Hindsight not healthy — skipping offload cycle.")
@@ -379,47 +410,45 @@ def _do_offload():
 
     # 5. Offload each non-essential entry to Hindsight
     # v2.2.1: Track success/failure explicitly — failed entries are KEPT.
-    #   Invariant: an entry is removed from L1 ONLY after durable L2
-    #   retention or verified existing L2 presence.
-    successfully_offloaded = []
-    failed_offloads = []
-
-    for entry in offloadable:
-        tags = get_tags(entry)
-        try:
-            # Dedup check — skip if already in Hindsight (LLM semantic or word-overlap)
-            if hindsight_recall_check(entry):
-                successfully_offloaded.append(entry)  # Already in L2 — safe to remove from L1
-                continue
-            success = hindsight_retain(entry, tags)
-            if success:
-                successfully_offloaded.append(entry)
-            else:
-                failed_offloads.append(entry)
-        except Exception:
-            failed_offloads.append(entry)
+    successfully_offloaded = _offload_entries(offloadable)
 
     # 6. Rewrite local memory: essential + FAILED entries (never lose data)
-    #    Only successfully-offloaded entries are removed from L1.
+    failed_offloads = [e for e in offloadable if e not in successfully_offloaded]
     kept = list(essential) + failed_offloads
 
     if successfully_offloaded:
         rewrite_memory_file(kept)
 
     # 7. Report (only if something happened)
+    _report_offload_results(successfully_offloaded, failed_offloads, essential, kept, capacity)
+
+
+def _offload_entries(offloadable: list) -> list:
+    """Offload each entry, tracking successes. Returns list of successfully offloaded entries."""
+    successfully_offloaded = []
+    for entry in offloadable:
+        tags = get_tags(entry)
+        if _offload_entry(entry, tags):
+            successfully_offloaded.append(entry)
+    return successfully_offloaded
+
+
+def _report_offload_results(successfully_offloaded, failed_offloads, essential, kept, capacity):
+    """Print offload summary if anything happened."""
+    if not (successfully_offloaded or failed_offloads):
+        return
     new_used = sum(len(e) for e in kept)
     new_pct = new_used / capacity
     # v2.2.1: llm_status now accurately reflects whether LLM was actually used
     llm_available = llm_judge is not None and llm_judge.is_llm_available() if llm_judge else False
     llm_status = "LLM-judged" if llm_available else "rule-based"
-    if successfully_offloaded or failed_offloads:
-        print(
-            f"Memory offload ({llm_status}): "
-            f"{len(successfully_offloaded)} entries moved to Hindsight, "
-            f"{len(failed_offloads)} failed (kept locally). "
-            f"Local: {new_used}/{capacity} ({new_pct:.0%}). "
-            f"{len(essential)} essential + {len(failed_offloads)} failed entries kept."
-        )
+    print(
+        f"Memory offload ({llm_status}): "
+        f"{len(successfully_offloaded)} entries moved to Hindsight, "
+        f"{len(failed_offloads)} failed (kept locally). "
+        f"Local: {new_used}/{capacity} ({new_pct:.0%}). "
+        f"{len(essential)} essential + {len(failed_offloads)} failed entries kept."
+    )
 
 
 if __name__ == "__main__":
