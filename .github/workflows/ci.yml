@@ -24,25 +24,22 @@ jobs:
       - name: Install uv
         run: pip install --only-binary ":all:" uv==0.5.4
 
-      - name: Export locked dependencies
-        run: uv export --frozen --extra dev --no-hashes -o requirements.lock
-
-      - name: Install dependencies from lock file
-        run: uv pip install --system --only-binary ":all:" -r requirements.lock
+      - name: Sync dependencies from lock file
+        run: uv sync --frozen --extra dev
 
       - name: Lint with ruff
-        run: ruff check scripts/ tests/
+        run: uv run ruff check scripts/ tests/
 
       - name: Type check with mypy
-        run: mypy scripts/ --ignore-missing-imports || true
+        run: uv run mypy scripts/ --ignore-missing-imports || true
 
       - name: Security scan with bandit
-        run: bandit -r scripts/ -c pyproject.toml || true
+        run: uv run bandit -r scripts/ -c pyproject.toml || true
 
       - name: Test with pytest
-        run: pytest tests/ -v --tb=short
+        run: uv run pytest tests/ -v --tb=short
 
       - name: Upload coverage
         if: matrix.python-version == '3.12'
-        run: pytest tests/ --cov=scripts --cov-report=xml
+        run: uv run pytest tests/ --cov=scripts --cov-report=xml
         # In a real repo, add: uses: codecov/codecov-action@v4
