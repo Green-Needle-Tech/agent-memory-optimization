@@ -985,38 +985,49 @@ def _print_audit_log():
               f"{e.get('memory_id', '')[:12]}... | {e.get('reason', '')[:60]}")
 
 
+def _trigger_consolidation(args, problems):
+    """Step 1: Trigger consolidation, return operation_id or None."""
+    if args.dry_run:
+        problems.append("[dry-run] Consolidation skipped")
+        return None
+    try:
+        status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
+        op_id = resp.get("operation_id")
+        if not op_id:
+            problems.append(f"Consolidate returned HTTP {status} but no operation_id: {str(resp)[:120]}")
+        return op_id
+    except Exception as e:
+        problems.append(f"Consolidate trigger failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _poll_consolidation(op_id, problems):
+    """Step 2: Poll consolidation operation until terminal state or timeout."""
+    deadline = time.time() + POLL_DEADLINE
+    while time.time() < deadline:
+        try:
+            _, op = http("GET", f"/v1/default/banks/{BANK}/operations/{op_id}", timeout=120)
+            st = op.get("status", "")
+            if st in ("completed", "failed", "error", "cancelled"):
+                return op
+        except Exception as e:
+            problems.append(f"Operation poll failed: {type(e).__name__}: {e}")
+            return None
+        time.sleep(POLL_INTERVAL)
+    return None
+
+
 def _run_consolidation(args, problems):
     """Steps 1-2: Trigger consolidation and poll for completion."""
-    op_id = None
-    if not args.dry_run:
-        try:
-            status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
-            op_id = resp.get("operation_id")
-            if not op_id:
-                problems.append(f"Consolidate returned HTTP {status} but no operation_id: {str(resp)[:120]}")
-        except Exception as e:
-            problems.append(f"Consolidate trigger failed: {type(e).__name__}: {e}")
-    else:
-        problems.append("[dry-run] Consolidation skipped")
+    op_id = _trigger_consolidation(args, problems)
+    if not op_id:
+        return None
 
-    final = None
-    if op_id:
-        deadline = time.time() + POLL_DEADLINE
-        while time.time() < deadline:
-            try:
-                _, op = http("GET", f"/v1/default/banks/{BANK}/operations/{op_id}", timeout=120)
-                st = op.get("status", "")
-                if st in ("completed", "failed", "error", "cancelled"):
-                    final = op
-                    break
-            except Exception as e:
-                problems.append(f"Operation poll failed: {type(e).__name__}: {e}")
-                break
-            time.sleep(POLL_INTERVAL)
-        if final is None:
-            problems.append(f"Consolidation op {op_id[:8]} did not finish within {POLL_DEADLINE}s")
-        elif final.get("status") != "completed":
-            problems.append(f"Consolidation op {op_id[:8]} ended with status={final.get('status')}")
+    final = _poll_consolidation(op_id, problems)
+    if final is None:
+        problems.append(f"Consolidation op {op_id[:8]} did not finish within {POLL_DEADLINE}s")
+    elif final.get("status") != "completed":
+        problems.append(f"Consolidation op {op_id[:8]} ended with status={final.get('status')}")
     return final
 
 
@@ -1098,6 +1109,38 @@ def _run_llm_passes(args, problems):
             problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
 
 
+def _get_hindsight_version():
+    """Fetch Hindsight API version as a comparable tuple."""
+    _, ver = http("GET", "/version", timeout=30)
+    api_version = ver.get("api_version", "0.0.0")
+    version_parts = tuple(int(x) for x in api_version.split(".")[:3] if x.isdigit())
+    return api_version, version_parts
+
+
+def _detect_stale_pages(pages, version_parts, api_version):
+    """Detect stale knowledge pages using version-appropriate strategy.
+
+    For Hindsight >= 0.9.1, tree is_stale is scope-aware — use it directly.
+    For older versions with small KBs, fall back to the mental-model workaround.
+    """
+    use_tree_stale_directly = version_parts >= (0, 9, 1)
+
+    if use_tree_stale_directly or len(pages) > KP_EXACT_CHECK_MAX:
+        return [n for n in pages if n.get("is_stale")], use_tree_stale_directly
+
+    # Old workaround: query each page's mental model
+    stale = []
+    for n in pages:
+        mm = n.get("mental_model_id")
+        if not mm:
+            continue
+        with contextlib.suppress(Exception):
+            _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=120)
+            if m.get("is_stale"):
+                stale.append(n)
+    return stale, use_tree_stale_directly
+
+
 def _check_knowledge_pages(problems):
     """Step 7: Knowledge Pages health (Hindsight >= 0.9 only)."""
     # v2.3: Version-gate the is_stale behavior. Per current Hindsight docs
@@ -1107,39 +1150,20 @@ def _check_knowledge_pages(problems):
     # workaround (querying mental models for small KBs) is only needed
     # for versions < 0.9.1.
     try:
-        # Check Hindsight version for behavior gating
-        _, ver = http("GET", "/version", timeout=30)
-        api_version = ver.get("api_version", "0.0.0")
-        version_parts = tuple(int(x) for x in api_version.split(".")[:3] if x.isdigit())
+        api_version, version_parts = _get_hindsight_version()
 
-        status, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=120)
+        _, tree = http("GET", f"/v1/default/banks/{BANK}/knowledge-base/tree", timeout=120)
         pages = [n for n in walk_tree(tree.get("roots")) if n.get("kind") == "page"]
-        if pages:
-            # v2.3: For Hindsight >= 0.9.1, tree is_stale is scope-aware —
-            # use it directly. For older versions, use the mental-model
-            # workaround for small KBs.
-            use_tree_stale_directly = version_parts >= (0, 9, 1)
+        if not pages:
+            return
 
-            if use_tree_stale_directly or len(pages) > KP_EXACT_CHECK_MAX:
-                # Trust the tree's is_stale signal (scope-aware in 0.9.1+)
-                stale = [n for n in pages if n.get("is_stale")]
-            else:
-                # Old workaround: query each page's mental model
-                stale = []
-                for n in pages:
-                    mm = n.get("mental_model_id")
-                    if not mm:
-                        continue
-                    with contextlib.suppress(Exception):
-                        _, m = http("GET", f"/v1/default/banks/{BANK}/mental-models/{mm}", timeout=120)
-                        if m.get("is_stale"):
-                            stale.append(n)
-            if stale and len(stale) / len(pages) > KP_STALE_RATIO_WARN:
-                problems.append(
-                    f"Knowledge Pages: {len(stale)}/{len(pages)} pages stale "
-                    f"(v{api_version}, {'scope-aware' if use_tree_stale_directly else 'approximate'} signal) "
-                    f"(e.g. {', '.join(n['name'] for n in stale[:3])}) — pages falling behind consolidation"
-                )
+        stale, use_tree_stale_directly = _detect_stale_pages(pages, version_parts, api_version)
+        if stale and len(stale) / len(pages) > KP_STALE_RATIO_WARN:
+            problems.append(
+                f"Knowledge Pages: {len(stale)}/{len(pages)} pages stale "
+                f"(v{api_version}, {'scope-aware' if use_tree_stale_directly else 'approximate'} signal) "
+                f"(e.g. {', '.join(n['name'] for n in stale[:3])}) — pages falling behind consolidation"
+            )
     except urllib.error.HTTPError:
         pass  # <0.9 or KB disabled — not an error
     except Exception as e:
@@ -1216,6 +1240,31 @@ def _handle_memory_offload(args, problems, n, pct):
             )
 
 
+def _build_telegram_text(unresolved, resolved):
+    """Build the Telegram notification HTML for unresolved issues."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    tg_text = (
+        f"<b>🧠 Daily Memory Optimization</b>\n"
+        f"<i>{timestamp}</i>\n\n"
+        f"<b>{len(unresolved)} issue(s) need your attention "
+        f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
+    )
+    for u in unresolved:
+        tg_text += f"  • {_escape_html(u)}\n"
+    return tg_text
+
+
+def _get_run_mode(args):
+    """Determine the current run mode string for output."""
+    if args.dry_run:
+        return "dry-run"
+    if args.apply:
+        return "apply"
+    if ALLOW_DESTRUCTIVE:
+        return "destructive"
+    return "safe"
+
+
 def _output_results(args, problems):
     """Step 9: Output: LLM auto-resolve → Telegram fallback."""
     if not problems:
@@ -1230,36 +1279,22 @@ def _output_results(args, problems):
         for r in resolved:
             print(f"  ✅ {r}")
 
-    if unresolved:
-        # Step 9c: notify user via Telegram DM for remaining issues
-        # v2.2.1: escape HTML in issue text to prevent Telegram parse errors
-        timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-        tg_text = (
-            f"<b>🧠 Daily Memory Optimization</b>\n"
-            f"<i>{timestamp}</i>\n\n"
-            f"<b>{len(unresolved)} issue(s) need your attention "
-            f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
-        )
-        for u in unresolved:
-            tg_text += f"  • {_escape_html(u)}\n"
+    if not unresolved:
+        return
 
-        # v2.2.1: check return value and report delivery status accurately
-        tg_sent = send_telegram_notification(tg_text)
-        delivery_status = (
-            "Telegram DM sent" if tg_sent
-            else "Telegram DM delivery FAILED (check bot token / chat ID)"
-        )
+    # Step 9c: notify user via Telegram DM for remaining issues
+    tg_text = _build_telegram_text(unresolved, resolved)
+    tg_sent = send_telegram_notification(tg_text)
+    delivery_status = (
+        "Telegram DM sent" if tg_sent
+        else "Telegram DM delivery FAILED (check bot token / chat ID)"
+    )
 
-        # Also print to stdout (for cron log visibility)
-        mode = (
-            "dry-run" if args.dry_run
-            else ("apply" if args.apply
-            else ("destructive" if ALLOW_DESTRUCTIVE
-            else "safe"))
-        )
-        print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
-        for u in unresolved:
-            print(f"  ⚠️ {u}")
+    # Also print to stdout (for cron log visibility)
+    mode = _get_run_mode(args)
+    print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
+    for u in unresolved:
+        print(f"  ⚠️ {u}")
 
 
 def main():
