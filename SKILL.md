@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 2.0.1
+version: 2.1.0
 author: Iris
 license: MIT
 trigger: >-
@@ -68,7 +68,7 @@ The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** fo
 
 3. **Contradiction detection** (`llm_judge.detect_contradictions`) — replaces manual scan with LLM-driven entity-drift detection. Resolution policy: recency-wins for state changes (invalidate old, keep new); flag-for-human for stable attributes (Hindsight blog, May 2026).
 
-**LLM-optional design** (MenteDB `llm_consolidation` pattern): all three operations degrade to rule-based fallbacks if the LLM endpoint is unavailable. Callers with no LLM simply get the old heuristic behavior — the engine stays functional. The `llm_judge` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `google/gemini-2.5-flash` by default (~$0.0001/call).
+**LLM-optional design** (MenteDB `llm_consolidation` pattern): all three operations degrade to rule-based fallbacks if the LLM endpoint is unavailable. Callers with no LLM simply get the old heuristic behavior — the engine stays functional. The `llm_judge` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `z-ai/glm-5.2` by default — an open-weight MIT-licensed model with a 1M context window and strong reasoning quality.
 
 **Non-destructive invalidation**: dedup and contradiction resolution use `PATCH /memories/{id} {"state":"invalidated"}` (recall-hidden, retained on disk for audit). Never `DELETE` — old state is recoverable.
 

@@ -29,6 +29,61 @@ The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** fo
 
 **Non-destructive invalidation**: dedup and contradiction resolution use `PATCH {"state":"invalidated"}` (recall-hidden, retained on disk for audit). Never `DELETE`.
 
+### LLM-as-Judge architecture
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        MEM1[L1 Memory entries]
+        MEM2[L2 Hindsight recall<br/>max 50 memories]
+    end
+
+    subgraph Judge["llm_judge.py — z-ai/glm-5.2"]
+        IC[classify_importance<br/>batched, ≤30 entries/call]
+        SD[semantic_dedup<br/>near-duplicate groups]
+        CD[detect_contradictions<br/>entity-drift pairs]
+    end
+
+    subgraph Fallback["Rule-based fallback"]
+        FB1[prefix matching]
+        FB2[word overlap >60%]
+        FB3[keyword entity drift]
+    end
+
+    subgraph Actions
+        A1[L1: offload low-value<br/>to Hindsight]
+        A2[L2: PATCH invalidated<br/>non-destructive]
+        A3[L2: recency-wins<br/>or flag-for-human]
+    end
+
+    MEM1 --> IC
+    MEM2 --> SD
+    MEM2 --> CD
+
+    IC -- LLM available --> A1
+    SD -- LLM available --> A2
+    CD -- LLM available --> A3
+
+    IC -- LLM unavailable --> FB1
+    SD -- LLM unavailable --> FB2
+    CD -- LLM unavailable --> FB3
+
+    FB1 --> A1
+    FB2 --> A2
+    FB3 --> A3
+
+    classDef input fill:#1f2937,stroke:#6366f1,color:#e5e7eb
+    classDef judge fill:#1f2937,stroke:#10b981,color:#a7f3d0
+    classDef fallback fill:#1f2937,stroke:#f59e0b,color:#fbbf24
+    classDef action fill:#1f2937,stroke:#3b82f6,color:#93c5fd
+    class MEM1,MEM2 input
+    class IC,SD,CD judge
+    class FB1,FB2,FB3 fallback
+    class A1,A2,A3 action
+```
+
+**Key design**: LLM-optional (MenteDB pattern) — every operation degrades to rule-based fallback if the LLM endpoint is unavailable. Batch consolidation (LycheeMemory V2) sends all entries in a single LLM call (≤30 per batch), reducing LLM calls 75-87% vs per-entry processing.
+
 ## Layer topology
 
 | Layer | Store | Holds | Rule of thumb |
@@ -51,7 +106,7 @@ cp agent-memory-optimization/scripts/*.py ~/.hermes/scripts/
 
 Requires a Hermes Agent instance. The L2 procedure targets a [Hindsight](https://hindsight.vectorize.io) (Vectorize.io) server; the L3 procedure targets a Karpathy-pattern LLM Wiki. Both layers are optional — the L1 procedure works standalone.
 
-**LLM-as-judge** (v2.0): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `google/gemini-2.5-flash` by default (~$0.0001/call). Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks.
+**LLM-as-judge** (v2.1): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `z-ai/glm-5.2` by default — an open-weight MIT-licensed model with a 1M context window and strong reasoning quality. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks.
 
 ## Procedure (summary)
 
