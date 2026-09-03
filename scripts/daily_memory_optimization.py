@@ -75,8 +75,10 @@ import urllib.request
 from pathlib import Path
 
 # Rule-based heuristics module (v3.0 — replaces llm_judge entirely)
+# paths (v3.3) — location-aware resolution, ships with this repo
 sys.path.insert(0, str(Path(__file__).parent))
 import memory_heuristics  # noqa: E402  (always available — ships with this repo)
+import paths  # noqa: E402
 
 # v2.3: structured memory records, paginated listing, candidate generation
 memory_records: types.ModuleType | None
@@ -93,15 +95,14 @@ try:
 except ImportError:
     memory_offload = None  # standalone run: offload step will be skipped
 
-# === Config (environment-overridable, no hardcoded /root) ===
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-BASE = os.environ.get("HINDSIGHT_URL", "http://localhost:8888")
-BANK = os.environ.get("HINDSIGHT_BANK", "main")
+# === Config (environment-overridable, location-aware — see paths.py) ===
+HERMES_HOME = paths.resolve_hermes_home()
+BASE = paths.resolve_hindsight_url(HERMES_HOME)
+BANK = paths.resolve_hindsight_bank(HERMES_HOME)
 MEM_FILE = Path(os.environ.get("MEMORY_FILE", str(HERMES_HOME / "memories" / "MEMORY.md")))
 USER_FILE = Path(os.environ.get("USER_FILE", str(HERMES_HOME / "memories" / "USER.md")))
 KB_DIR = Path(os.environ.get("KB_DIR", str(HERMES_HOME / "kb")))
-WIKI_DIR = Path(os.environ.get("WIKI_DIR", str(Path.home() / "wiki")))
-ENV_FILE = HERMES_HOME / ".env"
+WIKI_DIR = paths.resolve_wiki_dir(HERMES_HOME)
 
 POLL_INTERVAL = 10
 POLL_DEADLINE = 240          # 4 min max wait for consolidation (was 480 — caused cron timeouts)
@@ -177,18 +178,12 @@ def render_issue(issue: Issue) -> str:
 
 
 def _read_env_var(var_name):
-    """Read a variable from environment or ~/.hermes/.env file."""
-    val = os.environ.get(var_name, "")
-    if val:
-        return val
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith(var_name + "="):
-                return line.split("=", 1)[1].strip().strip("\"'")
-    return ""
+    """Read a variable: env var, then $HERMES_HOME/.env, then ~/.hermes/.env.
+
+    v3.3: delegates to paths.read_env_var (location-aware — probes the
+    existing deployment instead of only the current user's home).
+    """
+    return paths.read_env_var(var_name, hermes_home=HERMES_HOME)
 
 
 def _atomic_write_text(path: Path, content: str) -> None:

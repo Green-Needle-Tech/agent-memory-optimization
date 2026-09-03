@@ -26,9 +26,11 @@ Design invariants:
     short-circuits without any network call.
 
 Model: gemini-2.5-flash-lite via OpenRouter (cheap, fast, non-reasoning).
-API key resolution order:
+API key resolution order (v3.3, location-aware — see paths.py):
   1. OPENROUTER_API_KEY env var
-  2. ~/.hermes/.env (line starting with OPENROUTER_API_KEY=)
+  2. $HERMES_HOME/.env (HERMES_HOME resolved from the existing deployment,
+     not just the current user's home)
+  3. ~/.hermes/.env
 """
 
 import json
@@ -38,8 +40,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys_path_parent = str(Path(__file__).parent)
+import sys  # noqa: E402
+
+if sys_path_parent not in sys.path:
+    sys.path.insert(0, sys_path_parent)
+import paths  # noqa: E402  (location-aware resolution, ships with this repo)
+
 # === Config (environment-overridable) ===
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+HERMES_HOME = paths.resolve_hermes_home()
 JUDGE_ENABLED = os.environ.get("JUDGE_ENABLED", "1") not in ("0", "false", "no")
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "google/gemini-2.5-flash-lite")
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -56,22 +65,13 @@ VERDICT_KEEP = "keep"
 
 
 def load_api_key():
-    """Resolve the OpenRouter API key: env var first, then ~/.hermes/.env.
+    """Resolve the OpenRouter API key (v3.3 location-aware, see paths.py).
 
+    Order: env var -> $HERMES_HOME/.env -> ~/.hermes/.env.
     Returns None when no key is configured (judge disabled by absence).
     """
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if key:
-        return key
-    env_file = HERMES_HOME / ".env"
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith("OPENROUTER_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return None
+    key = paths.read_env_var("OPENROUTER_API_KEY", hermes_home=HERMES_HOME)
+    return key or None
 
 
 def is_available():

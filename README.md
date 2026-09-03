@@ -114,23 +114,28 @@ Requires a Hermes Agent instance. The L2 procedure targets a [Hindsight](https:/
 
 ### Environment variables
 
-All paths are dynamic — no hardcoded `/root`. The scripts resolve `~` via `os.path.expanduser` / `Path.home()`, so they work on any host (root, ubuntu, etc.).
+All locations are resolved from the *existing* deployment, not just the current user's home (`scripts/paths.py`, v3.3). Resolution chains (first hit wins):
+
+- **`HERMES_HOME`**: env var (explicit, always wins) → this script's own deployment dir (`<parent>/scripts/..`, validated by Hermes markers) → `~/.hermes` → first existing `/home/*/.hermes` with Hermes markers (covers root cron jobs against another user's install) → `~/.hermes` fallback.
+- **`HINDSIGHT_URL` / `HINDSIGHT_BANK`**: env var → `$HERMES_HOME/hindsight/config.json` (`api_url` / `bank_id`) → `http://localhost:8888` / `main`.
+- **Env values (`OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, ...)**: process env → `$HERMES_HOME/.env` → `~/.hermes/.env`.
+- **`WIKI_DIR`**: env var → `<Hermes user's home>/wiki` (`HERMES_HOME.parent/wiki`) → `~/wiki`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HERMES_HOME` | `~/.hermes` | Hermes config/data directory |
-| `WIKI_DIR` | `~/wiki` | Static LLM wiki directory (L3) |
+| `HERMES_HOME` | location-aware (see above) | Hermes config/data directory |
+| `WIKI_DIR` | location-aware (see above) | Static LLM wiki directory (L3) |
 | `KB_DIR` | `$HERMES_HOME/kb` | SA-Copilot knowledge bundle (L3) |
 | `MEMORY_FILE` | `$HERMES_HOME/memories/MEMORY.md` | L1 memory file |
 | `USER_FILE` | `$HERMES_HOME/memories/USER.md` | L1 user profile file |
-| `HINDSIGHT_URL` | `http://localhost:8888` | Hindsight API endpoint (L2) |
-| `HINDSIGHT_BANK` | `main` | Hindsight bank name |
+| `HINDSIGHT_URL` | `$HERMES_HOME/hindsight/config.json` → `http://localhost:8888` | Hindsight API endpoint (L2) |
+| `HINDSIGHT_BANK` | `$HERMES_HOME/hindsight/config.json` → `main` | Hindsight bank name |
 | `MEMORY_CHARS` | `2200` | L1 MEMORY.md char cap |
 | `USER_CHARS` | `1375` | L1 USER.md char cap |
 | `MEMORY_HEURISTICS_DRY_RUN` | (unset) | Set to `1` to enable dry-run mode |
 | `JUDGE_ENABLED` | `1` | `0` disables the LLM offload judge (zero network calls) |
 | `JUDGE_MODEL` | `google/gemini-2.5-flash-lite` | OpenRouter model for the offload judge |
-| `OPENROUTER_API_KEY` | `~/.hermes/.env` | Judge API key (env var wins; judge auto-disabled when absent) |
+| `OPENROUTER_API_KEY` | `$HERMES_HOME/.env` → `~/.hermes/.env` | Judge API key (env var wins; judge auto-disabled when absent) |
 
 ### Optional configuration
 

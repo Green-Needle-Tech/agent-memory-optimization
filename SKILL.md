@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.2.0
+version: 3.3.0
 author: Iris
 license: MIT
 trigger: >-
@@ -18,6 +18,15 @@ metadata:
 
 # Three-Layer Memory Optimization (L1 / L2 / L3)
 
+## Location-Aware Resolution (v3.3, Sep 2026)
+
+All script locations (`HERMES_HOME`, `HINDSIGHT_URL`, `HINDSIGHT_BANK`, `WIKI_DIR`, `.env` values incl. `OPENROUTER_API_KEY`) are resolved by `scripts/paths.py` from the *existing* deployment, not just the current user's home:
+
+- `HERMES_HOME`: env var (always wins) → script's own deployment dir (`scripts/..`, validated by Hermes markers) → `~/.hermes` → first `/home/*/.hermes` with markers (root cron against another user's install) → fallback.
+- `HINDSIGHT_URL`/`HINDSIGHT_BANK`: env → `$HERMES_HOME/hindsight/config.json` (`api_url`/`bank_id`) → defaults.
+- `.env` values: process env → `$HERMES_HOME/.env` → `~/.hermes/.env`.
+- `WIKI_DIR`: env → `HERMES_HOME.parent/wiki` (Hermes install owner's home) → `~/wiki`.
+
 ## When to Use
 - David asks to optimize/clean/prune/maintain memory (L1, L2, L3), offload local memory to Hindsight, dedup Hindsight, or lint the wiki.
 - MEMORY.md or USER.md exceeds 75% capacity, or a periodic deep-maintenance run is requested (beyond the automated cron jobs).
@@ -32,7 +41,7 @@ Each maintenance run is independent. Always re-check current state (capacities, 
 ## Layer Topology
 - **L1 — Local memory** (`memory` tool): MEMORY.md (2,200 chars) + USER.md (1,375 chars). Always injected every turn.
 - **L2 — Hindsight** (localhost:8888, bank `main`): semantic recall on demand. Episodes, preferences, decisions.
-- **L3 — LLM Wiki / OKF bundle**: compiled knowledge. SA-Copilot bundle at `~/.hermes/kb` (git-versioned); older static wiki at `~/wiki/` (or `$WIKI_DIR` if set).
+- **L3 — LLM Wiki / OKF bundle**: compiled knowledge. SA-Copilot bundle at `$HERMES_HOME/kb` (git-versioned); older static wiki at the Hermes user's `wiki/` (location-aware: `$WIKI_DIR` env → `HERMES_HOME.parent/wiki` → `~/wiki`).
 - **Division of labor:** L1 = "must know this turn" · L2 = "recall when relevant" · L3 = "compiled knowledge with sources". A fact existing in two layers lives in the deepest layer that surfaces it reliably — usually L2.
 
 ## L2 ↔ L3 Bridge: Hindsight and the Wiki (research, Aug 2026)
@@ -70,7 +79,7 @@ v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 
 - **Fail-safe, not fail-loud.** Any judge failure (no key, API down, timeout, parse error) falls back to the full rule-based offload set — v3.1 behavior. `JUDGE_ENABLED=0` disables with zero network calls.
 - **Privacy.** Content is PII-redacted (`memory_records.redact_pii`); sensitive/credential-like entries are never sent to the judge and keep their rule-based verdict.
 - **Attribution.** OpenRouter calls carry `X-Title`/`HTTP-Referer` = project name (Green-Needle-Tech/agent-memory-optimization), never localhost.
-- **Config:** `JUDGE_MODEL` (default `google/gemini-2.5-flash-lite`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_TEMPERATURE` (0). Key resolution: `OPENROUTER_API_KEY` env → `~/.hermes/.env`.
+- **Config:** `JUDGE_MODEL` (default `google/gemini-2.5-flash-lite`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_TEMPERATURE` (0). Key resolution (v3.3, location-aware): `OPENROUTER_API_KEY` env → `$HERMES_HOME/.env` → `~/.hermes/.env`.
 
 Live-verified behavior (Sep 2026): historical provider rankings and one-time debugging lessons → offload confirmed; volatile container state (current port, restart policy) → vetoed, kept in L1.
 

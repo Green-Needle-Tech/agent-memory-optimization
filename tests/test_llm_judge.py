@@ -41,12 +41,16 @@ class TestKeyResolution:
         assert llm_judge.load_api_key() == "sk-from-file"
 
     def test_no_key(self, monkeypatch, tmp_path):
+        # v3.3: key resolution falls back to ~/.hermes/.env — pin HOME so the
+        # test stays hermetic on hosts that have a real key there.
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
         assert llm_judge.load_api_key() is None
 
     def test_is_available_no_key(self, monkeypatch, tmp_path):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
         assert llm_judge.is_available() is False
@@ -74,6 +78,7 @@ class TestFailSafe:
     def test_no_key_returns_all(self, monkeypatch, tmp_path):
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))  # hermetic: no ~/.hermes/.env fallback
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(self.ENTRIES)
         assert confirmed == [0, 1]

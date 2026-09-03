@@ -61,15 +61,17 @@ import urllib.request
 from pathlib import Path
 
 # Rule-based heuristics module (hard gate) + scoped LLM judge (v3.2)
+# paths (v3.3) — location-aware resolution, ships with this repo
 sys.path.insert(0, str(Path(__file__).parent))
 import llm_judge  # noqa: E402
 import memory_heuristics  # noqa: E402
+import paths  # noqa: E402
 
-# === Config (environment-overridable, no hardcoded /root) ===
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+# === Config (environment-overridable, location-aware — see paths.py) ===
+HERMES_HOME = paths.resolve_hermes_home()
 MEMORY_FILE = Path(os.environ.get("MEMORY_FILE", str(HERMES_HOME / "memories" / "MEMORY.md")))
-HINDSIGHT_URL = os.environ.get("HINDSIGHT_URL", "http://localhost:8888")
-BANK = os.environ.get("HINDSIGHT_BANK", "main")
+HINDSIGHT_URL = paths.resolve_hindsight_url(HERMES_HOME)
+BANK = paths.resolve_hindsight_bank(HERMES_HOME)
 CAPACITY_MAX = int(os.environ.get("MEMORY_CHARS", "2200"))  # chars
 OFFLOAD_THRESHOLD = float(os.environ.get("OFFLOAD_THRESHOLD", "0.75"))  # 75%
 LOCK_FILE = MEMORY_FILE.with_suffix(".lock")  # MEMORY.lock next to MEMORY.md

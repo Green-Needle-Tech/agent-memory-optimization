@@ -53,9 +53,13 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
+# Location-aware resolution (v3.3) — ships with this repo
+sys.path.insert(0, str(Path(__file__).parent))
+import paths  # noqa: E402
+
 # === Config ===
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+HERMES_HOME = paths.resolve_hermes_home()
 CONFIG_FILE = HERMES_HOME / "memory_heuristics.json"
 
 # Hard-keep prefixes — consolidated from the old llm_judge.py and

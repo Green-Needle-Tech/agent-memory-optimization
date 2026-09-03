@@ -16,6 +16,7 @@ v2.4 additions:
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import urllib.error
@@ -24,10 +25,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Location-aware resolution (v3.3) — ships with this repo
+sys.path.insert(0, str(Path(__file__).parent))
+import paths  # noqa: E402
+
 # === Config ===
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-BASE = os.environ.get("HINDSIGHT_URL", "http://localhost:8888")
-BANK = os.environ.get("HINDSIGHT_BANK", "main")
+HERMES_HOME = paths.resolve_hermes_home()
+BASE = paths.resolve_hindsight_url(HERMES_HOME)
+BANK = paths.resolve_hindsight_bank(HERMES_HOME)
 SCAN_CURSOR_FILE = HERMES_HOME / "scripts" / ".memory_scan_cursor.json"
 AUDIT_LOG_FILE = HERMES_HOME / "scripts" / ".memory_audit_log.jsonl"
 AUDIT_MAX_ENTRIES = 500  # keep last N audit entries
