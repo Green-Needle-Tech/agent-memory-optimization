@@ -13,6 +13,17 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
+## v3.3 — Location-Aware Path Resolution (Sep 2026)
+
+All script locations are now resolved from the **existing deployment**, not just the current user's home. New shared module `scripts/paths.py` (stdlib-only), used by every script:
+
+- **`HERMES_HOME`**: env var (explicit, always wins) → this script's own deployment dir (`<parent>/scripts/..`, validated by Hermes markers) → `~/.hermes` → first existing `/home/*/.hermes` with Hermes markers (covers root cron jobs running against another user's install) → fallback.
+- **`HINDSIGHT_URL` / `HINDSIGHT_BANK`**: env var → `$HERMES_HOME/hindsight/config.json` (`api_url` / `bank_id`) → defaults.
+- **`.env` values** (`OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, ...): process env → `$HERMES_HOME/.env` → `~/.hermes/.env`.
+- **`WIKI_DIR`**: env var → `<Hermes user's home>/wiki` (`HERMES_HOME.parent/wiki`) → `~/wiki`.
+
+The repo checkout itself is never mistaken for a Hermes install (marker validation: `config.yaml`, `memories/`, `hindsight/`, `skills/`). Live-verified: scripts deployed under a non-root Hermes home and run with a different `HOME` correctly resolve every location from that deployment.
+
 ## v3.2 — Scoped LLM Judge for the Offload Gate (Sep 2026)
 
 v3.0 replaced all LLM-as-judge operations with deterministic rules. v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 → L2 offload gate (`scripts/llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter).
@@ -22,7 +33,7 @@ v3.0 replaced all LLM-as-judge operations with deterministic rules. v3.2 reintro
 - **Privacy** — content is PII-redacted; sensitive/credential-like entries are never sent to the cloud judge and keep their rule-based verdict.
 - **Attribution** — OpenRouter calls carry `X-Title`/`HTTP-Referer` set to the project name, never localhost.
 
-Config: `JUDGE_MODEL` (default `google/gemini-2.5-flash-lite`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_TEMPERATURE` (0). Key resolution: `OPENROUTER_API_KEY` env var → `~/.hermes/.env`.
+Config: `JUDGE_MODEL` (default `google/gemini-2.5-flash-lite`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_TEMPERATURE` (0). Key resolution (v3.3, location-aware): `OPENROUTER_API_KEY` env var → `$HERMES_HOME/.env` → `~/.hermes/.env`.
 
 ## v3.0 — Rule-Based Heuristics (Sep 2026)
 
@@ -139,7 +150,7 @@ All locations are resolved from the *existing* deployment, not just the current 
 
 ### Optional configuration
 
-`~/.hermes/memory_heuristics.json` — user overrides for essential prefixes, offload patterns, and state attributes. Invalid configuration falls back to defaults with a warning.
+`$HERMES_HOME/memory_heuristics.json` — user overrides for essential prefixes, offload patterns, and state attributes. Invalid configuration falls back to defaults with a warning.
 
 ```json
 {
@@ -198,7 +209,7 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 13. **Rule-based auto-resolve** (v3.0): if any issues were collected, attempt to resolve them with the fixed remediation allowlist (7 action types). Destructive actions (invalidate) are disabled by default — pass `--allow-destructive` or `--apply` to enable.
 14. **Telegram notification**: if any issues remain unresolved after rule-based remediation, send a DM to the user. HTML content is escaped. Delivery status is reported accurately. Silent if all issues are resolved or no issues found.
 
-Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
+Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `$HERMES_HOME/scripts/` and schedule as a no-agent cron. Works from any user's crontab — locations resolve to the existing deployment (v3.3).
 
 ### CLI flags
 
@@ -240,7 +251,7 @@ flowchart TD
     L1B -- no --> L3A
     OFF --> L3A
 
-    L3A[L3: Stale-page scan<br/>~/.hermes/kb] --> L3B{≥ 5 active pages<br/>> 90 days stale?}
+    L3A[L3: Stale-page scan<br/>$HERMES_HOME/kb + WIKI_DIR] --> L3B{≥ 5 active pages<br/>> 90 days stale?}
     L3B -- yes --> LINT[Run llmwiki lint --json<br/>5-min timeout, read-only]
     LINT --> COLLECT[Collect: summary +<br/>failure issues]
     L3B -- no --> OUT{Any issues<br/>collected?}
