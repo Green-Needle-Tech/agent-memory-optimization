@@ -16,19 +16,18 @@ Covers all 16 spec test cases from section 16:
   - Scale test (10k entries)
 """
 
+import json
 import os
 import sys
-import time
-import json
 import tempfile
+import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Ensure scripts directory is in sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import memory_heuristics as mh
-
 
 # ============================================================================
 # Classification (spec section 16: 7 cases)
@@ -339,8 +338,8 @@ class TestScale:
         for i in range(9000):
             entries.append(f"Entry {i} about topic {i % 500} with unique identifier xyz{i}")
         # 1000 duplicates of earlier entries
-        for i in range(1000):
-            src = random.randrange(9000)
+        for _i in range(1000):
+            src = random.randrange(9000)  # noqa: S311
             entries.append(entries[src])
 
         # Dedup

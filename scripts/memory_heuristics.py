@@ -95,7 +95,7 @@ DEFAULT_OFFLOAD_PATTERNS = (
 SCORE_RULES = (
     # (rule_id, regex, score)
     ("SCORE_ACTIVE_ENDPOINT", r"\b(?:localhost:\d{4}|https?://\S+|endpoint is)\b", 4),
-    ("SCORE_ACTIVE_STATE", r"\b(?:current|active)\b.*\b(?:provider|model|url|port|version|bank|endpoint|database)\b", 4),
+    ("SCORE_ACTIVE_STATE", r"\b(?:current|active)\b.*\b(?:provider|model|url|port|version|bank|endpoint|database)\b", 4),  # noqa: E501
     ("SCORE_RECURRING_WORKAROUND", r"\b(?:quirk|fix:|workaround|recurring)\b", 3),
     ("SCORE_EVERY_TURN_PREFERENCE", r"\b(?:every turn|always injected|must know)\b", 3),
     ("SCORE_RUNTIME_CAPABILITY", r"\b(?:runs on|vcpu|ram|disk|installed)\b", 2),
@@ -137,11 +137,15 @@ PROTECTED_VALUE_PATTERNS = (
     ("ip", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), 0),
     ("port", re.compile(r"\bport\s*(?:is|=|:)?\s*(\d{2,5})\b", re.IGNORECASE), 1),
     ("semver", re.compile(r"\bv?\d+\.\d+(?:\.\d+)?(?:[-+][\w.-]+)?\b"), 0),
-    ("model", re.compile(r"\b(?:gpt|glm|claude|gemini|gemma|llama|mistral|qwen|deepseek|gpt-oss)[\w.-]*\b", re.IGNORECASE), 0),
+    ("model", re.compile(
+        r"\b(?:gpt|glm|claude|gemini|gemma|llama|mistral|qwen|deepseek|gpt-oss)[\w.-]*\b",
+        re.IGNORECASE), 0),
     ("date", re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?\b"), 0),
     ("email_like_host", re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE), 0),
     ("path", re.compile(r"(?:~|\.\.|/)[\w./-]+(?:\.[A-Za-z]{1,8})\b"), 0),
-    ("quantity", re.compile(r"\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|tb|vcpu|cpu|cores?|chars?|hours?|days?|minutes?|tokens?|%)\b", re.IGNORECASE), 0),
+    ("quantity", re.compile(
+        r"\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|tb|vcpu|cpu|cores?|chars?|hours?|days?|minutes?|tokens?|%)\b",
+        re.IGNORECASE), 0),
     ("bool", re.compile(r"\b(?:true|false|enabled|disabled)\b", re.IGNORECASE), 0),
 )
 
@@ -677,7 +681,7 @@ def _generate_candidates(norms):
             for b in range(a + 1, len(idxs)):
                 pair = (idxs[a], idxs[b])
                 pair_counts[pair] = pair_counts.get(pair, 0) + 1
-    for tri, idxs in by_trigram.items():
+    for _tri, idxs in by_trigram.items():
         if len(idxs) > MAX_INDEX_LIST:
             continue
         for a in range(len(idxs)):

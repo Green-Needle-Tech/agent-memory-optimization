@@ -387,15 +387,15 @@ def _do_offload():
         if _offload_entry(entry, tags):
             safe_to_remove.append(entry)
             if dry_run:
-                print(f"DRY RUN: would remove entry from L1 (already present or retained in L2)")
-                print(f"  Rule: OFFLOAD_SAFE_TO_REMOVE")
+                print("DRY RUN: would remove entry from L1 (already present or retained in L2)")
+                print("  Rule: OFFLOAD_SAFE_TO_REMOVE")
                 print(f"  Entry: {entry[:80]}")
         else:
             failed.append(entry)
             entries_to_keep.append(entry)  # never lose data
             if dry_run:
-                print(f"DRY RUN: would keep entry in L1 (L2 retain failed)")
-                print(f"  Rule: OFFLOAD_RETAIN_FAILED")
+                print("DRY RUN: would keep entry in L1 (L2 retain failed)")
+                print("  Rule: OFFLOAD_RETAIN_FAILED")
                 print(f"  Entry: {entry[:80]}")
 
     # 6. Rewrite local memory: essential + FAILED entries (never lose data)

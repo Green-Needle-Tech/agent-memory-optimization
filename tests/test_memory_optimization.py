@@ -24,10 +24,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import daily_memory_optimization
-import memory_heuristics
 import memory_offload
 import memory_records
-
 
 # ============================================================================
 # Memory Offload: helper functions
