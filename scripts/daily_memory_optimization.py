@@ -21,6 +21,8 @@ heuristics (memory_heuristics.py). Zero external chat-completion calls.
     reporting only, no memory mutation
   - audit log for every mutation (rule id, confidence, reason, timestamp)
 
+v3.0.1 (Sep 2026): Timeout fix — skip consolidation when pending=0, POLL_DEADLINE 480→240s,
+SCRIPT_TIME_BUDGET=540s guard on remaining steps. Fixes 3 consecutive cron timeouts.
 v2.3 (Sep 2026): Correctness — structured records, deterministic recency, paginated scanning.
 v2.2.1 (Sep 2026): Safety patch — fact_type-aware invalidation, Telegram
 HTML escaping, accurate delivery status, env-var config, atomic state writes.
@@ -102,7 +104,8 @@ WIKI_DIR = Path(os.environ.get("WIKI_DIR", str(Path.home() / "wiki")))
 ENV_FILE = HERMES_HOME / ".env"
 
 POLL_INTERVAL = 10
-POLL_DEADLINE = 480          # 8 min max wait for consolidation
+POLL_DEADLINE = 240          # 4 min max wait for consolidation (was 480 — caused cron timeouts)
+SCRIPT_TIME_BUDGET = 540     # global soft limit: skip remaining steps if exceeded (cron timeout is 600s)
 MEM_CAP = int(os.environ.get("MEMORY_CHARS", "2200"))
 USER_CAP = int(os.environ.get("USER_CHARS", "1375"))
 MEM_WARN = 0.90              # warn at 90% capacity
@@ -123,6 +126,13 @@ ALLOW_DESTRUCTIVE = False
 # v2.0.1: self-pollution guards
 SMOKE_TEST_TAG = "daily-memopt-smoke"   # tag on the retain smoke-test memory
 SMOKE_TEST_MAX_AGE_S = 172800           # smoke-test memories older than 48h = junk
+
+# v3.0.1: global runtime guard — skip remaining steps if budget exceeded
+_RUN_START = time.time()
+
+def _time_remaining():
+    """Return True if we still have time budget, False if exceeded."""
+    return (time.time() - _RUN_START) < SCRIPT_TIME_BUDGET
 META_MEMORY_PATTERNS = [                # reports ABOUT past maintenance runs = noise
     r"stable-attribute conflict was flagged",
     r"conflict was flagged",
@@ -750,12 +760,23 @@ def _print_audit_log():
 
 
 def _trigger_consolidation(args, issues):
-    """Step 1: Trigger consolidation, return operation_id or None."""
+    """Step 1: Trigger consolidation, return operation_id or None.
+
+    v3.0.1: Skip when pending_consolidation == 0 — nothing to consolidate,
+    and the POST triggers a no-op that still needs polling.
+    """
     if _is_dry_run(args):
         issues.append(Issue(code="L2_CONSOLIDATION_PENDING", severity="info",
                              message="[dry-run] Consolidation skipped"))
         return None
     try:
+        # Check if there's anything pending first
+        _, stats = http("GET", f"/v1/default/banks/{BANK}/stats", timeout=30)
+        pending = stats.get("pending_consolidation", 0)
+        if pending == 0:
+            # Nothing to consolidate — skip the poll loop entirely
+            return None
+
         status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
         op_id = resp.get("operation_id")
         if not op_id:
@@ -1429,13 +1450,21 @@ def main():
     _check_bank_stats(issues)
 
     # --- 5-10. Self-pollution cleanup + heuristic passes ------------------
-    _run_heuristic_passes(args, issues)
+    if _time_remaining():
+        _run_heuristic_passes(args, issues)
+    else:
+        issues.append(Issue(
+            code="SCRIPT_TIME_BUDGET_EXCEEDED", severity="warning",
+            message=f"Script time budget ({SCRIPT_TIME_BUDGET}s) exceeded after consolidation+smoke — heuristic passes skipped",
+        ))
 
     # --- 11. Knowledge Pages health (Hindsight >= 0.9 only) ---------------
-    _check_knowledge_pages(issues)
+    if _time_remaining():
+        _check_knowledge_pages(issues)
 
     # --- 12. L3 wiki lint-lite -------------------------------------------
-    _check_l3_wiki(issues)
+    if _time_remaining():
+        _check_l3_wiki(issues)
 
     # --- 13. Local memory capacity check ---------------------------------
     _check_local_memory(args, issues)
