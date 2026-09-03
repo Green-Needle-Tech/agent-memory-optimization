@@ -84,7 +84,7 @@ TAG_MAP = {
     "Search fallback:": ["dev-workflow", "search"],
     "Composio MCP:": ["composio", "mcp"],
     "lintlang": ["lintlang", "dev-workflow"],
-    "GLM 5.2 provider": ["providers", "glm-5.2"],
+    "Gemini 2.5 Flash-Lite provider": ["providers", "gemini-2.5-flash-lite"],
     "coding-agent-orchestration": ["skills", "dev-workflow"],
 }
 

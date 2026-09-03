@@ -38,7 +38,7 @@ Usage:
 
 Configuration:
   Reads OPENROUTER_API_KEY from ~/.hermes/.env (or environment).
-  Uses z-ai/glm-5.2 by default.
+  Uses google/gemini-2.5-flash-lite by default.
   Override via env: LLM_JUDGE_MODEL, LLM_JUDGE_BASE_URL, LLM_JUDGE_API_KEY.
 """
 
@@ -55,7 +55,7 @@ from pathlib import Path
 #   - PII redaction is applied before sending content
 #   - Only LLM_JUDGE_LOCAL_MODEL models are accepted
 #   - A warning is printed if a cloud model is configured while local mode is on
-DEFAULT_MODEL = os.environ.get("LLM_JUDGE_MODEL", "z-ai/glm-5.2")
+DEFAULT_MODEL = os.environ.get("LLM_JUDGE_MODEL", "google/gemini-2.5-flash-lite")
 DEFAULT_BASE_URL = os.environ.get("LLM_JUDGE_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_MAX_TOKENS = 6000
 DEFAULT_TEMPERATURE = 0.1  # low temp for classification consistency
@@ -718,7 +718,7 @@ if __name__ == "__main__":
         "David's output language is English only regardless of input language.",
         "User prefers Python for systems programming.",
         "User's primary coding language is Python.",
-        "GLM 5.2 provider was switched to OpenRouter on Aug 2026.",
+        "Gemini 2.5 Flash-Lite provider switched via OpenRouter on Sep 2026.",
         "Previous model provider was z-ai direct, switched to OpenRouter.",
     ]
 

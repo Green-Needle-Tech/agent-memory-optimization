@@ -94,7 +94,7 @@ flowchart LR
         MEM2[L2 Hindsight recall<br/>max 50 memories]
     end
 
-    subgraph Judge["llm_judge.py — z-ai/glm-5.2"]
+    subgraph Judge["llm_judge.py — google/gemini-2.5-flash-lite"]
         IC[classify_importance<br/>batched, ≤30 entries/call]
         SD[semantic_dedup<br/>near-duplicate groups]
         CD[detect_contradictions<br/>entity-drift pairs]
@@ -182,7 +182,7 @@ All paths are dynamic — no hardcoded `/root`. The scripts resolve `~` via `os.
 | `MEMORY_CHARS` | `2200` | L1 MEMORY.md char cap |
 | `USER_CHARS` | `1375` | L1 USER.md char cap |
 
-**LLM-as-judge** (v2.1+): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `z-ai/glm-5.2` by default — an open-weight MIT-licensed model with a 1M context window. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks. The `llm_status` reported by `memory_offload.py` now accurately reflects whether the LLM endpoint is actually reachable (via `is_llm_available()`), not just whether the module imported.
+**LLM-as-judge** (v2.1+): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `google/gemini-2.5-flash-lite` by default — a lightweight reasoning model optimized for ultra-low latency and cost efficiency. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks. The `llm_status` reported by `memory_offload.py` now accurately reflects whether the LLM endpoint is actually reachable (via `is_llm_available()`), not just whether the module imported.
 
 ## Procedure (summary)
 
@@ -225,7 +225,7 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 7. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
 8. L1 capacity check (≥90% warns / triggers Hindsight offload — now LLM-driven classification)
 9. L3 wiki lint-lite (≥5 pages >90 days stale warns)
-10. **LLM auto-resolve** (v2.2, updated v2.2.1): if any issues were collected, attempt to resolve them with `z-ai/glm-5.2` (one LLM call) — consolidate (always allowed), invalidate stale memories, or tune Hindsight config. **Destructive actions (invalidate, config_tune) are disabled by default** — pass `--allow-destructive` to enable. Config keys are allowlisted.
+10. **LLM auto-resolve** (v2.2, updated v2.2.1): if any issues were collected, attempt to resolve them with `google/gemini-2.5-flash-lite` (one LLM call) — consolidate (always allowed), invalidate stale memories, or tune Hindsight config. **Destructive actions (invalidate, config_tune) are disabled by default** — pass `--allow-destructive` to enable. Config keys are allowlisted.
 11. **Telegram notification** (v2.2, updated v2.2.1): if any issues remain unresolved after the LLM attempt, send a DM to the user. HTML content is escaped. Delivery status is reported accurately (was always "sent" even on failure). Silent if all issues are resolved or no issues found.
 
 Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
@@ -262,7 +262,7 @@ flowchart TD
     L3B -- no --> OUT{Any issues<br/>collected?}
     COLLECT --> OUT
 
-    OUT -- yes --> RESOLVE[LLM auto-resolve<br/>z-ai/glm-5.2 one try]
+    OUT -- yes --> RESOLVE[LLM auto-resolve<br/>google/gemini-2.5-flash-lite one try]
     RESOLVE --> RESOLVED{All issues<br/>resolved?}
     RESOLVED -- yes --> SILENT([Silent: empty stdout<br/>exit 0])
     RESOLVED -- no --> TG([Send Telegram DM<br/>to user])

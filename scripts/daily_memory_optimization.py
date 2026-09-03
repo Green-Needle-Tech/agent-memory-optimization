@@ -29,7 +29,7 @@ v2.2.1 (Sep 2026): Safety patch.
 
 v2.2 (Sep 2026): LLM auto-resolve + Telegram notification.
   - After collecting issues, the script attempts to resolve them using
-    z-ai/glm-5.2 (one LLM call): consolidate, invalidate stale memories,
+    google/gemini-2.5-flash-lite (one LLM call): consolidate, invalidate stale memories,
     or tune Hindsight config
   - Issues the LLM cannot auto-resolve are sent as a Telegram DM notification
   - Silent if all issues are resolved by the LLM or no issues found
@@ -359,7 +359,7 @@ def _execute_config_tune_action(item, issue):
 
 
 def try_resolve_issues_with_llm(problems):
-    """Attempt to resolve collected issues using z-ai/glm-5.2 (one try).
+    """Attempt to resolve collected issues using google/gemini-2.5-flash-lite (one try).
 
     v2.2.1: LLM auto-mutation is DISABLED by default. The LLM is used as
     an ADVISOR only — it proposes actions, but destructive actions
