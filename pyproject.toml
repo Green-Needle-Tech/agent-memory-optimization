@@ -1,6 +1,6 @@
 [project]
 name = "agent-memory-optimization"
-version = "3.1.0"
+version = "3.2.0"
 description = "Three-layer AI agent memory optimization: L1 local, L2 Hindsight semantic recall, L3 LLM Wiki"
 readme = "README.md"
 license = {file = "LICENSE"}

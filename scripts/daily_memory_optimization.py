@@ -1455,7 +1455,10 @@ def main():
     else:
         issues.append(Issue(
             code="SCRIPT_TIME_BUDGET_EXCEEDED", severity="warning",
-            message=f"Script time budget ({SCRIPT_TIME_BUDGET}s) exceeded after consolidation+smoke — heuristic passes skipped",
+            message=(
+                f"Script time budget ({SCRIPT_TIME_BUDGET}s) exceeded after "
+                "consolidation+smoke — heuristic passes skipped"
+            ),
         ))
 
     # --- 11. Knowledge Pages health (Hindsight >= 0.9 only) ---------------

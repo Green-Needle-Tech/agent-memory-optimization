@@ -5,6 +5,20 @@ Runs via cron (no_agent=True). When local MEMORY.md exceeds the capacity
 threshold, offloads non-essential entries to Hindsight and removes them
 from local memory.
 
+v3.2 (Sep 2026): Scoped LLM judge for the offload gate.
+  - Rule-based heuristics remain the hard gate (quarantine, pins,
+    essential prefixes, offload patterns, weighted scoring)
+  - Entries the rules mark OFFLOADABLE are then reviewed by a
+    Gemini 2.5 Flash Lite judge (OpenRouter) which confirms which
+    are genuinely low-value and safe to move to L2
+  - The judge can only VETO an offload (keep in L1) — it can never
+    unlock one the rules kept
+  - Fail-safe: any judge failure (API down, no key, parse error)
+    falls back to the v3.1 rule-based behavior
+  - Privacy: content is PII-redacted; sensitive entries never reach
+    the judge (see llm_judge.py + memory_records.prepare_for_judging)
+  - Disable with JUDGE_ENABLED=0
+
 v3.0 (Sep 2026): LLM-as-judge removed — deterministic heuristics.
   - Classification via memory_heuristics.classify_importance() (weighted
     rule scoring, hard keep/offload rules, explainable decisions)
@@ -46,8 +60,9 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-# Rule-based heuristics module (replaces llm_judge — no LLM calls anywhere)
+# Rule-based heuristics module (hard gate) + scoped LLM judge (v3.2)
 sys.path.insert(0, str(Path(__file__).parent))
+import llm_judge  # noqa: E402
 import memory_heuristics  # noqa: E402
 
 # === Config (environment-overridable, no hardcoded /root) ===
@@ -289,15 +304,38 @@ def rewrite_memory_file(entries_to_keep):
 
 
 def classify_entries(entries):
-    """Classify entries as essential or offloadable (rule-based, v3.0).
+    """Classify entries as essential or offloadable (rules + LLM judge, v3.2).
 
-    Uses memory_heuristics.classify_importance() — deterministic weighted
-    rules with hard keep/offload overrides. Quarantined (secret-like)
-    entries are kept locally and never auto-offloaded.
+    Stage 1 — hard gate (memory_heuristics.classify_importance()):
+    deterministic weighted rules with hard keep/offload overrides.
+    Quarantined (secret-like) entries are kept locally and never
+    auto-offloaded.
+
+    Stage 2 — scoped LLM judge (llm_judge.judge_offload_candidates()):
+    a Gemini 2.5 Flash Lite judge reviews the rule-offloadable entries and
+    confirms which are genuinely low-value (safe to move to L2). The judge
+    can only VETO an offload — it never unlocks one the rules kept. Any
+    judge failure falls back to the full rule-based offload set.
     """
     essential_idx, offloadable_idx = memory_heuristics.classify_importance(entries)
     essential = [entries[i] for i in essential_idx if 0 <= i < len(entries)]
-    offloadable = [entries[i] for i in offloadable_idx if 0 <= i < len(entries)]
+
+    # Judge confirmation on the rule-offloadable set (fail-safe).
+    candidates = [(i, entries[i]) for i in offloadable_idx if 0 <= i < len(entries)]
+    confirmed_idx, vetoed_idx, status = llm_judge.judge_offload_candidates(candidates)
+    offloadable = [entries[i] for i in confirmed_idx if 0 <= i < len(entries)]
+
+    if vetoed_idx:
+        judge_kept = [entries[i] for i in vetoed_idx if 0 <= i < len(entries)]
+        print(
+            f"Judge ({llm_judge.JUDGE_MODEL}, {status}): kept {len(judge_kept)} "
+            f"rule-offloadable entries in L1 (vetoed offload)"
+        )
+        for entry in judge_kept:
+            print(f"  kept: {entry[:80]}")
+    elif status in ("fallback", "disabled", "skipped"):
+        # Silent: judge is an enhancement, not a dependency.
+        pass
     return essential, offloadable
 
 

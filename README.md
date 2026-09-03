@@ -13,6 +13,17 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
+## v3.2 — Scoped LLM Judge for the Offload Gate (Sep 2026)
+
+v3.0 replaced all LLM-as-judge operations with deterministic rules. v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 → L2 offload gate (`scripts/llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter).
+
+- **Rules stay the hard gate** — the judge only reviews entries the heuristics already marked OFFLOADABLE, and can only **veto** an offload (keep in L1); it can never unlock one. Quarantined, pinned, and essential-prefix entries never reach the judge.
+- **Fail-safe** — any judge failure (no key, API down, timeout, parse error) falls back to the full rule-based offload set. `JUDGE_ENABLED=0` disables it with zero network calls.
+- **Privacy** — content is PII-redacted; sensitive/credential-like entries are never sent to the cloud judge and keep their rule-based verdict.
+- **Attribution** — OpenRouter calls carry `X-Title`/`HTTP-Referer` set to the project name, never localhost.
+
+Config: `JUDGE_MODEL` (default `google/gemini-2.5-flash-lite`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_TEMPERATURE` (0). Key resolution: `OPENROUTER_API_KEY` env var → `~/.hermes/.env`.
+
 ## v3.0 — Rule-Based Heuristics (Sep 2026)
 
 Replaces all LLM-as-judge operations with **deterministic, local rule-based heuristics**. Zero external chat-completion calls. Standard library only.
@@ -50,6 +61,10 @@ flowchart LR
         CD[detect_contradictions<br/>structured claim comparison]
     end
 
+    subgraph Judge["llm_judge.py — scoped, fail-safe"]
+        J[Gemini 2.5 Flash Lite<br/>veto-only confirmation<br/>PII-redacted]
+    end
+
     subgraph Actions
         A1[L1: offload low-value<br/>to Hindsight]
         A2[L2: PATCH invalidated<br/>non-destructive]
@@ -60,15 +75,18 @@ flowchart LR
     MEM2 --> SD
     MEM2 --> CD
 
-    IC --> A1
+    IC -->|"offloadable candidates"| J
+    J -->|"confirmed / vetoed<br/>(fallback: rules)"| A1
     SD --> A2
     CD --> A3
 
     classDef input fill:#1f2937,stroke:#6366f1,color:#e5e7eb
     classDef heur fill:#1f2937,stroke:#10b981,color:#a7f3d0
+    classDef judge fill:#1f2937,stroke:#f59e0b,color:#fde68a
     classDef action fill:#1f2937,stroke:#3b82f6,color:#93c5fd
     class MEM1,MEM2 input
     class IC,SD,CD heur
+    class J judge
     class A1,A2,A3 action
 ```
 
@@ -110,6 +128,9 @@ All paths are dynamic — no hardcoded `/root`. The scripts resolve `~` via `os.
 | `MEMORY_CHARS` | `2200` | L1 MEMORY.md char cap |
 | `USER_CHARS` | `1375` | L1 USER.md char cap |
 | `MEMORY_HEURISTICS_DRY_RUN` | (unset) | Set to `1` to enable dry-run mode |
+| `JUDGE_ENABLED` | `1` | `0` disables the LLM offload judge (zero network calls) |
+| `JUDGE_MODEL` | `google/gemini-2.5-flash-lite` | OpenRouter model for the offload judge |
+| `OPENROUTER_API_KEY` | `~/.hermes/.env` | Judge API key (env var wins; judge auto-disabled when absent) |
 
 ### Optional configuration
 
@@ -243,7 +264,8 @@ flowchart TD
 **Key invariants**
 - Health green ≠ writes working — the retain smoke-test (`total_tokens > 0`) catches silent LLM-layer failures
 - Exit 0 always; errors surface via stdout, never via nonzero exit
-- Zero external chat-completion calls — all heuristics are deterministic and local
+- Heuristic passes (dedup, contradictions) are deterministic and local — zero external chat-completion calls
+- The offload judge (v3.2) is scoped and fail-safe: rules gate first, the judge can only veto, and any judge failure falls back to the rule-based verdict
 - Safety invariant: an entry may be removed from L1 only after durable L2 retention or verified existing L2 presence
 - Conservative mutation: only exact and strong duplicates are auto-invalidated; possible duplicates are report-only
 - Timestamp safety: recall order is never treated as chronological order; recency_wins requires reliable timestamps or explicit transitions
