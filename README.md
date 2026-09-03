@@ -168,7 +168,7 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 9. **Contradiction scan** (v3.0): structured claim extraction; recency_wins only for high-confidence state changes with reliable chronology; stable and uncertain conflicts flagged for human review
 10. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
 11. L1 capacity check (≥90% warns / triggers Hindsight offload — rule-based classification)
-12. L3 wiki lint-lite (≥5 pages >90 days stale warns)
+12. **L3 stale-page lint trigger** (v3.1): ≥5 active pages >90 days stale (frontmatter `updated` with mtime fallback; `_archive/` and index pages excluded; strictly >90) runs one read-only lint pass — `llmwiki lint --wiki-dir <dir> --json`, falling back to `python3 -m llmwiki lint`, 5-minute timeout, no LLM-powered rules. The JSON report is summarized: pages scanned, error/warning/info counts, up to 3 representative issues. Missing CLI, timeout, malformed output, and nonzero exit are reported as unresolved issues without crashing the run.
 13. **Rule-based auto-resolve** (v3.0): if any issues were collected, attempt to resolve them with the fixed remediation allowlist (7 action types). Destructive actions (invalidate) are disabled by default — pass `--allow-destructive` or `--apply` to enable.
 14. **Telegram notification**: if any issues remain unresolved after rule-based remediation, send a DM to the user. HTML content is escaped. Delivery status is reported accurately. Silent if all issues are resolved or no issues found.
 
@@ -214,8 +214,9 @@ flowchart TD
     L1B -- no --> L3A
     OFF --> L3A
 
-    L3A[L3: Wiki lint-lite<br/>~/.hermes/kb] --> L3B{≥ 5 pages<br/>> 90 days stale?}
-    L3B -- yes --> COLLECT
+    L3A[L3: Stale-page scan<br/>~/.hermes/kb] --> L3B{≥ 5 active pages<br/>> 90 days stale?}
+    L3B -- yes --> LINT[Run llmwiki lint --json<br/>5-min timeout, read-only]
+    LINT --> COLLECT[Collect: summary +<br/>failure issues]
     L3B -- no --> OUT{Any issues<br/>collected?}
     COLLECT --> OUT
 
@@ -232,7 +233,7 @@ flowchart TD
     classDef resolve fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef done fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef tg fill:#1f2937,stroke:#3b82f6,color:#93c5fd
-    class L2A,L2B,L2C,L2D,CLEAN,DEDUP,CONTRA,KP3,KP4,L1A,L3A,OFF,COLLECT layer
+    class L2A,L2B,L2C,L2D,CLEAN,DEDUP,CONTRA,KP3,KP4,L1A,L3A,OFF,LINT,COLLECT layer
     class POLL,KP,KP2,KP5,L1B,L3B,OUT,RESOLVED decision
     class ERR,RESOLVE warn
     class START,SILENT done

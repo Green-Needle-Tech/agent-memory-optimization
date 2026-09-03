@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.0.0
+version: 3.1.0
 author: Iris
 license: MIT
 trigger: >-
@@ -194,7 +194,7 @@ One summary per layer: what was offloaded/invalidated/linted, before/after L1 %,
 9. **Contradiction scan** (v3.0): `memory_heuristics.detect_contradictions()` — structured claim extraction; recency_wins only for high-confidence state changes with reliable chronology; stable and uncertain conflicts flagged for human review.
 10. **Knowledge Pages health** (`GET /knowledge-base/tree`, 0.9+): warn when >50% of pages are stale. For KBs ≤25 pages the script queries each page's mental model for exact per-page `is_stale`. 404 on older versions = skip silently.
 11. L1 capacity: MEMORY.md/USER.md ≥90% → warn; ≥90% MEMORY.md triggers offload (rule-based classification)
-12. L3 wiki lint-lite: ≥5 pages older than 90 days → warn
+12. **L3 stale-page lint trigger** (v3.1): ≥5 active pages >90 days stale (frontmatter `updated` with mtime fallback; `_archive/` and index pages excluded) runs one read-only lint pass (`llmwiki lint --wiki-dir <dir> --json`, `python3 -m llmwiki` fallback, 5-min timeout, no LLM-powered rules) and summarizes the JSON report (pages scanned, error/warning/info counts, up to 3 sample issues). Missing CLI, timeout, malformed output, nonzero exit → unresolved issues, never a crash
 13. **Rule-based auto-resolve** (v3.0): if any issues were collected, attempt to resolve them with the fixed remediation allowlist (7 action types). Destructive actions (invalidate) are disabled by default — pass `--allow-destructive` or `--apply` to enable.
 14. **Telegram notification**: if any issues remain unresolved after rule-based remediation, send a DM to the user. HTML content is escaped. Delivery status is reported accurately. Silent if all issues are resolved or no issues found.
 

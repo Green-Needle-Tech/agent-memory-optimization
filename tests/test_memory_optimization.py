@@ -15,8 +15,11 @@ Covers:
 """
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -710,3 +713,263 @@ class TestAuditLog:
                 assert len(entries) == 1
                 assert entries[0]["memory_id"] == "test-123"
                 assert entries[0]["action"] == "invalidate"
+
+
+# ============================================================================
+# L3 stale-page lint trigger (v3.1)
+# ============================================================================
+
+class TestL3StalePageLintTrigger:
+    """Acceptance criteria for the >=5-stale-pages lint trigger."""
+
+    def _make_wiki(self, tmpdir, stale_count, mtime_days_ago=120,
+                    updated_days_ago=None):
+        """Create a wiki dir with `stale_count` stale pages + 2 fresh pages."""
+        wiki = Path(tmpdir) / "kb"
+        wiki.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        for i in range(stale_count):
+            p = wiki / f"stale{i}.md"
+            if updated_days_ago is not None:
+                ts = now - updated_days_ago * 86400
+                d = time.strftime("%Y-%m-%d", time.localtime(ts))
+                p.write_text(f"---\ntitle: Stale {i}\nupdated: {d}\n---\nbody\n")
+            else:
+                p.write_text(f"---\ntitle: Stale {i}\n---\nbody\n")
+                os.utime(p, (now - mtime_days_ago * 86400, now - mtime_days_ago * 86400))
+        for i in range(2):
+            p = wiki / f"fresh{i}.md"
+            p.write_text(f"---\ntitle: Fresh {i}\n---\nbody\n")
+        return wiki
+
+    def test_parse_frontmatter_updated_date_only(self):
+        ts = daily_memory_optimization._parse_frontmatter_updated(
+            "---\nupdated: 2026-01-15\n---\n")
+        assert ts is not None
+        assert time.strftime("%Y-%m-%d", time.localtime(ts)) == "2026-01-15"
+
+    def test_parse_frontmatter_updated_datetime(self):
+        ts = daily_memory_optimization._parse_frontmatter_updated(
+            "---\nupdated: 2026-01-15T10:30:00\n---\n")
+        assert ts is not None
+        assert time.strftime("%Y-%m-%d", time.localtime(ts)) == "2026-01-15"
+
+    def test_parse_frontmatter_updated_invalid(self):
+        text = "---\nupdated: not-a-date\n---\n"
+        assert daily_memory_optimization._parse_frontmatter_updated(text) is None
+        assert daily_memory_optimization._parse_frontmatter_updated("no frontmatter") is None
+
+    def test_page_age_uses_frontmatter_over_mtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "page.md"
+            p.write_text("---\nupdated: 2026-08-30\n---\nbody\n")
+            old = time.time() - 120 * 86400
+            os.utime(p, (old, old))   # mtime says 120 days; frontmatter says ~4
+            age = daily_memory_optimization._page_age_days(p)
+            assert age < 10, f"frontmatter should win, got {age} days"
+
+    def test_page_age_invalid_updated_falls_back_to_mtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "page.md"
+            p.write_text("---\nupdated: garbage\n---\nbody\n")
+            old = time.time() - 100 * 86400
+            os.utime(p, (old, old))
+            age = daily_memory_optimization._page_age_days(p)
+            assert 99 < age < 101
+
+    def test_page_age_exactly_90_days_not_stale(self):
+        # Deterministic clock: integer-valued `now` makes the 90-day boundary
+        # exact in float arithmetic (no sub-second drift across the threshold).
+        now = float(int(time.time()))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=5, mtime_days_ago=91)
+            # All five pages exactly 90 days old -> none stale (strictly >)
+            for p in wiki.glob("stale*.md"):
+                os.utime(p, (now - 90 * 86400, now - 90 * 86400))
+            with patch.object(daily_memory_optimization.time, "time",
+                              return_value=now), \
+                 patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                stale, pages = daily_memory_optimization._find_stale_pages(wiki)
+                assert stale == []
+                # and the trigger therefore does not fire
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command") as run:
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    run.assert_not_called()
+                    assert issues == []
+
+    def test_archive_and_index_pages_excluded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = Path(tmpdir) / "kb"
+            wiki.mkdir(parents=True)
+            now = time.time()
+            old = now - 120 * 86400
+            # 3 genuinely stale active pages
+            for i in range(3):
+                p = wiki / f"active{i}.md"
+                p.write_text("body\n")
+                os.utime(p, (old, old))
+            # 2 stale pages in _archive/ (must not count)
+            arch = wiki / "_archive"
+            arch.mkdir()
+            for i in range(2):
+                p = arch / f"arch{i}.md"
+                p.write_text("body\n")
+                os.utime(p, (old, old))
+            # stale index page (must not count)
+            idx = wiki / "index.md"
+            idx.write_text("index\n")
+            os.utime(idx, (old, old))
+            stale, pages = daily_memory_optimization._find_stale_pages(wiki)
+            assert len(stale) == 3
+            assert all("_archive" not in s.parts for s in stale)
+            assert all(s.name.lower() != "index.md" for s in stale)
+
+    def test_four_stale_pages_do_not_run_lint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=4)
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command") as run:
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    run.assert_not_called()
+                    assert issues == []
+
+    def test_five_stale_pages_run_exactly_one_lint_pass(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=5)
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command",
+                                  return_value=(None, None)) as run:
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    run.assert_called_once()
+                    assert len(issues) == 1
+                    assert issues[0].code == "L3_LINT_CLI_UNAVAILABLE"
+
+    def test_lint_json_report_summarized(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=6)
+            payload = {
+                "pages_scanned": 8,
+                "issues": [
+                    {"severity": "error", "page": "a.md", "message": "broken link"},
+                    {"severity": "warning", "page": "b.md", "message": "missing type"},
+                    {"severity": "warning", "page": "c.md", "message": "long page"},
+                    {"severity": "info", "page": "d.md", "message": "low confidence"},
+                    {"severity": "error", "page": "e.md", "message": "orphan"},
+                ],
+            }
+            proc = subprocess.CompletedProcess(
+                ["llmwiki"], 0, stdout=json.dumps(payload), stderr="")
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command",
+                                  return_value=(proc, "cli")):
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    assert len(issues) == 1
+                    issue = issues[0]
+                    assert issue.code == "L3_LINT_REPORT"
+                    assert "8 pages scanned" in issue.message
+                    assert "2 errors, 2 warnings, 1 info" in issue.message
+                    # up to 3 representative issues, not the full dump
+                    assert issue.message.count("[error]") <= 3
+                    assert "e.md" not in issue.message  # 4th+ issue not included
+                    assert issue.context["error_count"] == 2
+                    assert issue.context["pages_scanned"] == 8
+
+    def test_lint_nonzero_exit_reported_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=5)
+            payload = {"pages_scanned": 7, "error": 1, "warning": 0, "info": 0}
+            proc = subprocess.CompletedProcess(
+                ["llmwiki"], 2, stdout=json.dumps(payload), stderr="boom")
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command",
+                                  return_value=(proc, "cli")):
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    codes = [i.code for i in issues]
+                    assert "L3_LINT_REPORT" in codes
+                    assert "L3_LINT_NONZERO_EXIT" in codes
+
+    def test_lint_malformed_output_reported(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=5)
+            proc = subprocess.CompletedProcess(
+                ["llmwiki"], 0, stdout="not json at all", stderr="")
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command",
+                                  return_value=(proc, "cli")):
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    assert len(issues) == 1
+                    assert issues[0].code == "L3_LINT_MALFORMED_OUTPUT"
+
+    def test_lint_timeout_reported(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=5)
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_run_lint_command",
+                                  return_value=("timeout", "timeout")):
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    assert len(issues) == 1
+                    assert issues[0].code == "L3_LINT_TIMEOUT"
+
+    def test_lint_command_candidates_order(self):
+
+        cmds = daily_memory_optimization._build_lint_commands(Path("/data/kb"))
+        assert cmds[0] == ["llmwiki", "lint", "--wiki-dir", "/data/kb", "--json"]
+        # fallback: python -m llmwiki (same interpreter as this script)
+        assert cmds[1][0] == (sys.executable or "python3")
+        assert cmds[1][1:] == ["-m", "llmwiki", "lint", "--wiki-dir", "/data/kb", "--json"]
+
+    def test_extract_lint_counts_nested_summary(self):
+        payload = {"summary": {"error": 2, "warning": 3, "info": 1},
+                   "total_pages": 10}
+        pages, counts = daily_memory_optimization._extract_lint_counts(payload)
+        assert pages == 10
+        assert counts == {"error": 2, "warning": 3, "info": 1}
+
+    def test_extract_lint_counts_flat_lists(self):
+        payload = {"pages": ["a.md", "b.md"],
+                   "error": [{"x": 1}], "warning": [], "info": [1, 2]}
+        pages, counts = daily_memory_optimization._extract_lint_counts(payload)
+        assert pages == 2
+        assert counts == {"error": 1, "warning": 0, "info": 2}
+
+    def test_check_l3_wiki_never_crashes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki = self._make_wiki(tmpdir, stale_count=5)
+            with patch.object(daily_memory_optimization, "KB_DIR", wiki), \
+                 patch.object(daily_memory_optimization, "WIKI_DIR",
+                              Path(tmpdir) / "nonexistent"):
+                with patch.object(daily_memory_optimization,
+                                  "_find_stale_pages",
+                                  side_effect=RuntimeError("boom")):
+                    issues = []
+                    daily_memory_optimization._check_l3_wiki(issues)
+                    assert len(issues) == 1
+                    assert issues[0].code == "L3_WIKI_CHECK_FAILED"

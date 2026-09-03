@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily memory optimization — L1/L2/L3 maintenance for Hermes Agent (v3.0).
+"""Daily memory optimization — L1/L2/L3 maintenance for Hermes Agent (v3.1).
 
 no-agent cron script: stdout is delivered verbatim; empty stdout = silent.
 
@@ -43,7 +43,13 @@ Behavior (per memory-optimization skill):
   L1 (local memory):
     12. MEMORY.md / USER.md capacity check; >=90% triggers Hindsight offload
   L3 (LLM wiki / OKF bundle):
-    13. Wiki lint-lite: stale-page count (>90 days)
+    13. Stale-page lint trigger: >=5 active pages >90 days stale (frontmatter
+        `updated` with mtime fallback; _archive/ and index pages excluded)
+        runs one read-only lint pass (llmwiki lint --json, python3 -m llmwiki
+        fallback, 5-min timeout) and summarizes the JSON report (pages scanned,
+        error/warning/info counts, up to 3 sample issues). Lint failures
+        (missing CLI, timeout, malformed output, nonzero exit) are reported
+        as unresolved issues without crashing the run.
   14. Deterministic remediation rules (allowlist)
   15. Telegram notification for unresolved issues
 
@@ -980,24 +986,254 @@ def _check_knowledge_pages(issues):
         ))
 
 
+# --- L3 stale-page lint trigger (v3.1) -----------------------------------
+
+L3_STALE_TRIGGER = 5            # run lint when >= this many active pages are stale
+LINT_TIMEOUT_S = 300            # five-minute timeout on the lint pass
+LINT_SAMPLE_ISSUES = 3          # max representative issues reported
+LINT_ISSUE_KEYS = ("error", "warning", "info")   # lint JSON severity keys
+
+# Frontmatter `updated:` value patterns (stdlib-only parsing — no yaml dep)
+_FM_UPDATED_RE = re.compile(
+    r"^updated:\s*[\"']?(\d{4}-\d{2}-\d{2})"
+    r"(?:[T ](\d{2}:\d{2}(?::\d{2})?))?",
+    re.MULTILINE,
+)
+
+
+def _parse_frontmatter_updated(text):
+    """Return epoch seconds for frontmatter `updated`, or None when absent/invalid.
+
+    Accepts date-only (YYYY-MM-DD) or datetime (ISO `T` or space separator)
+    values. Timezone offsets are ignored (local-time assumption) — staleness
+    of 90+ days is insensitive to sub-day precision.
+    """
+    m = _FM_UPDATED_RE.search(text)
+    if not m:
+        return None
+    date_s, time_s = m.group(1), m.group(2)
+    try:
+        y, mo, d = (int(x) for x in date_s.split("-"))
+        hh = mm = ss = 0
+        if time_s:
+            parts = time_s.split(":")
+            hh, mm = int(parts[0]), int(parts[1])
+            ss = int(parts[2]) if len(parts) > 2 else 0
+        return time.mktime((y, mo, d, hh, mm, ss, 0, 0, -1))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _is_index_page(path):
+    """Index pages (index.md, INDEX.md) don't count toward staleness."""
+    return path.name.lower() == "index.md"
+
+
+def _collect_active_pages(wiki_dir):
+    """Active (non-archived, non-index) markdown pages under wiki_dir."""
+    return [
+        p for p in wiki_dir.rglob("*.md")
+        if "_archive" not in p.parts and not _is_index_page(p)
+    ]
+
+
+def _page_age_days(path, now=None):
+    """Page age in days: frontmatter `updated` when valid, else file mtime."""
+    now = time.time() if now is None else now
+    try:
+        fm_ts = _parse_frontmatter_updated(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        fm_ts = None
+    ts = fm_ts if fm_ts is not None and fm_ts <= now + 86400 else path.stat().st_mtime
+    return max(0.0, (now - ts) / 86400.0)
+
+
+def _find_stale_pages(wiki_dir):
+    """Active pages strictly older than KB_STALE_DAYS days."""
+    now = time.time()
+    pages = _collect_active_pages(wiki_dir)
+    stale = [p for p in pages if _page_age_days(p, now) > KB_STALE_DAYS]
+    return stale, pages
+
+
+def _build_lint_commands(wiki_dir):
+    """Lint command candidates: CLI first, then python3 -m fallback."""
+    return [
+        ["llmwiki", "lint", "--wiki-dir", str(wiki_dir), "--json"],
+        [sys.executable or "python3", "-m", "llmwiki",
+         "lint", "--wiki-dir", str(wiki_dir), "--json"],
+    ]
+
+
+def _run_lint_command(wiki_dir):
+    """Run one lint pass (CLI, then module fallback). Returns (proc, cmd_kind).
+
+    proc is a CompletedProcess, or None when the CLI is unavailable.
+    cmd_kind is "cli" or "module" (for reporting), or None with proc=None.
+    """
+    import shutil
+    import subprocess
+    for cmd in _build_lint_commands(wiki_dir):
+        try:
+            if cmd[0] != sys.executable and not shutil.which(cmd[0]):
+                continue
+            proc = subprocess.run(  # noqa: S603 (fixed argv, no shell)
+                cmd, capture_output=True, text=True, timeout=LINT_TIMEOUT_S,
+            )
+            return proc, "cli" if cmd[0] == "llmwiki" else "module"
+        except subprocess.TimeoutExpired:
+            return "timeout", "timeout"
+        except OSError:
+            continue
+    return None, None
+
+
+def _extract_lint_counts(payload):
+    """Best-effort lint counters from arbitrary JSON shapes.
+
+    Returns (pages_scanned, counts dict {error, warning, info}).
+    """
+    counts = {k: 0 for k in LINT_ISSUE_KEYS}
+    pages_scanned = None
+    if not isinstance(payload, dict):
+        return pages_scanned, counts
+
+    # Pages scanned: common key names, else count of a pages/files array
+    for key in ("pages_scanned", "pages", "scanned", "total_pages", "files_scanned"):
+        v = payload.get(key)
+        if isinstance(v, int):
+            pages_scanned = v
+            break
+    if pages_scanned is None:
+        for key in ("pages", "files", "results"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                pages_scanned = len(v)
+                break
+
+    # Counts: top-level ints, nested summary dicts, or issue lists
+    for sev in LINT_ISSUE_KEYS:
+        v = payload.get(sev)
+        if isinstance(v, int):
+            counts[sev] = v
+        elif isinstance(v, list):
+            counts[sev] = len(v)
+    for key in ("summary", "counts", "stats", "totals"):
+        sub = payload.get(key)
+        if isinstance(sub, dict):
+            for sev in LINT_ISSUE_KEYS:
+                v = sub.get(sev)
+                if isinstance(v, int):
+                    counts[sev] = max(counts[sev], v)
+                elif isinstance(v, list):
+                    counts[sev] = max(counts[sev], len(v))
+    issues_list = None
+    for key in ("issues", "problems", "findings", "violations"):
+        v = payload.get(key)
+        if isinstance(v, list) and issues_list is None:
+            issues_list = v
+    if issues_list is not None:
+        for item in issues_list:
+            sev = item.get("severity") or item.get("level") if isinstance(item, dict) else None
+            if sev in counts:
+                counts[sev] += 1
+    return pages_scanned, counts
+
+
+def _extract_lint_issues(payload, limit=LINT_SAMPLE_ISSUES):
+    """Up to `limit` representative issue strings from lint JSON."""
+    if not isinstance(payload, dict):
+        return []
+    for key in ("issues", "problems", "findings", "violations"):
+        v = payload.get(key)
+        if isinstance(v, list):
+            out = []
+            for item in v[:limit]:
+                if isinstance(item, str):
+                    out.append(item)
+                elif isinstance(item, dict):
+                    sev = item.get("severity") or item.get("level") or "issue"
+                    msg = (item.get("message") or item.get("description")
+                           or item.get("rule") or item.get("title") or "unspecified issue")
+                    page = (item.get("page") or item.get("file")
+                            or item.get("path") or item.get("title"))
+                    out.append(f"{msg} [{sev}]" if page is None
+                               else f"{page}: {msg} [{sev}]")
+            return out
+    return []
+
+
+def _report_lint_result(wiki_dir, stale_count, total, issues):
+    """Run the lint pass and append report/failure Issues. Never raises."""
+    try:
+        proc, cmd_kind = _run_lint_command(wiki_dir)
+    except Exception as e:  # defensive: lint must never crash maintenance
+        issues.append(Issue(
+            code="L3_LINT_FAILED", severity="warning",
+            message=f"L3 lint pass ({wiki_dir}) failed unexpectedly: {type(e).__name__}",
+        ))
+        return
+    if proc is None:
+        issues.append(Issue(
+            code="L3_LINT_CLI_UNAVAILABLE", severity="warning",
+            message=f"L3 lint trigger ({wiki_dir}): {stale_count} of {total} active pages "
+                    f"stale (> {KB_STALE_DAYS} days), but no llmwiki CLI found "
+                    f"(llmwiki / python3 -m llmwiki) — install to enable lint",
+        ))
+        return
+    if proc == "timeout":
+        issues.append(Issue(
+            code="L3_LINT_TIMEOUT", severity="warning",
+            message=f"L3 lint pass ({wiki_dir}) timed out after {LINT_TIMEOUT_S}s "
+                    f"({stale_count} of {total} active pages stale) — unresolved",
+        ))
+        return
+    stdout, returncode = proc.stdout or "", proc.returncode
+    try:
+        payload = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        payload = None
+    if payload is None:
+        issues.append(Issue(
+            code="L3_LINT_MALFORMED_OUTPUT", severity="warning",
+            message=f"L3 lint pass ({wiki_dir}, {cmd_kind}) produced "
+                    f"{'no JSON output' if not stdout.strip() else 'malformed JSON'} "
+                    f"(exit {returncode}) — unresolved",
+        ))
+        return
+    pages_scanned, counts = _extract_lint_counts(payload)
+    sample = _extract_lint_issues(payload)
+    ctx = {f"{k}_count": v for k, v in counts.items()}
+    if pages_scanned is not None:
+        ctx["pages_scanned"] = pages_scanned
+    detail = f"{counts['error']} errors, {counts['warning']} warnings, {counts['info']} info"
+    if pages_scanned is not None:
+        detail = f"{pages_scanned} pages scanned — " + detail
+    if sample:
+        detail += "; e.g. " + "; ".join(sample)
+    issues.append(Issue(
+        code="L3_LINT_REPORT", severity="warning",
+        message=f"L3 lint pass ({wiki_dir}): {stale_count} of {total} active pages stale "
+                f"(> {KB_STALE_DAYS} days) — {detail}",
+        context=ctx,
+    ))
+    if returncode != 0:
+        issues.append(Issue(
+            code="L3_LINT_NONZERO_EXIT", severity="warning",
+            message=f"L3 lint pass ({wiki_dir}, {cmd_kind}) exited {returncode} "
+                    f"(results above may be incomplete) — unresolved",
+        ))
+
+
 def _check_l3_wiki(issues):
-    """Step 12: L3 wiki lint-lite."""
+    """Step 12: L3 wiki lint trigger — full lint pass on >= 5 stale active pages."""
     try:
         for wiki_dir in (KB_DIR, WIKI_DIR):
-            if wiki_dir.exists():
-                md_files = [p for p in wiki_dir.rglob("*.md") if "_archive" not in p.parts]
-                stale = []
-                cutoff = time.time() - KB_STALE_DAYS * 86400
-                for p in md_files:
-                    if p.stat().st_mtime < cutoff and "index.md" not in p.name.lower():
-                        stale.append(p.name)
-                if len(stale) >= 5:
-                    issues.append(Issue(
-                        code="L3_WIKI_STALE", severity="warning",
-                        message=f"L3 wiki ({wiki_dir}): {len(stale)} of {len(md_files)} pages "
-                                f"older than {KB_STALE_DAYS} days "
-                                f"(e.g. {', '.join(sorted(stale)[:3])}) — run llm-wiki lint / refresh",
-                    ))
+            if not wiki_dir.exists():
+                continue
+            stale, pages = _find_stale_pages(wiki_dir)
+            if len(stale) >= L3_STALE_TRIGGER:
+                _report_lint_result(wiki_dir, len(stale), len(pages), issues)
     except Exception as e:
         issues.append(Issue(
             code="L3_WIKI_CHECK_FAILED", severity="warning",
