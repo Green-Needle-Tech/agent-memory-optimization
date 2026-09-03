@@ -1057,10 +1057,18 @@ def _find_stale_pages(wiki_dir):
 
 
 def _build_lint_commands(wiki_dir):
-    """Lint command candidates: CLI first, then python3 -m fallback."""
+    """Lint command candidates: CLI first, then script-path fallback.
+
+    The llmwiki wrapper script lives at ~/.hermes/scripts/llmwiki. The PyPI
+    package (if installed) provides a `llmbase` CLI; our wrapper bridges the
+    `lint --wiki-dir --json` interface to it.
+    """
+    # 1. llmwiki on PATH (symlinked wrapper or installed package)
+    # 2. python3 <scripts_dir>/llmwiki (direct script execution)
+    scripts_dir = HERMES_HOME / "scripts" / "llmwiki"
     return [
         ["llmwiki", "lint", "--wiki-dir", str(wiki_dir), "--json"],
-        [sys.executable or "python3", "-m", "llmwiki",
+        [sys.executable or "python3", str(scripts_dir),
          "lint", "--wiki-dir", str(wiki_dir), "--json"],
     ]
 

@@ -942,9 +942,9 @@ class TestL3StalePageLintTrigger:
 
         cmds = daily_memory_optimization._build_lint_commands(Path("/data/kb"))
         assert cmds[0] == ["llmwiki", "lint", "--wiki-dir", "/data/kb", "--json"]
-        # fallback: python -m llmwiki (same interpreter as this script)
+        # fallback: python <scripts_dir>/llmwiki (same interpreter as this script)
         assert cmds[1][0] == (sys.executable or "python3")
-        assert cmds[1][1:] == ["-m", "llmwiki", "lint", "--wiki-dir", "/data/kb", "--json"]
+        assert cmds[1][2:] == ["lint", "--wiki-dir", "/data/kb", "--json"]
 
     def test_extract_lint_counts_nested_summary(self):
         payload = {"summary": {"error": 2, "warning": 3, "info": 1},
