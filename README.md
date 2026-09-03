@@ -13,97 +13,41 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
-## v2.0 — LLM-as-Judge (Aug 2026)
+## v3.0 — Rule-Based Heuristics (Sep 2026)
 
-The v2.0 upgrade replaces brittle rule-based heuristics with **LLM-as-judge** for three operations:
+Replaces all LLM-as-judge operations with **deterministic, local rule-based heuristics**. Zero external chat-completion calls. Standard library only.
 
-| Operation | Old (v1.x) | New (v2.0) | Research basis |
-|-----------|-----------|-----------|----------------|
-| Importance classification | Hardcoded prefix matching | LLM-rated retention value (batched call) | Park et al. + Hindsight fact-extraction-as-filter |
-| Semantic dedup | Word overlap >60% | LLM judge identifies same-fact-different-wording | MenteDB `llm_consolidation`, 30-40% reduction |
-| Contradiction detection | Manual scan | LLM finds entity-drift pairs, auto-resolves state changes | Hindsight blog recency-wins policy |
+| Operation | Old (v2.x) | New (v3.0) |
+|-----------|-----------|-----------|
+| Importance classification | LLM batched call | Weighted scoring rules + hard keep/offload overrides |
+| Semantic dedup | LLM identifies same-fact-different-wording | SHA-256 exact hash + structured claim matching + Jaccard/containment thresholds |
+| Contradiction detection | LLM finds entity-drift pairs | Structured claim extraction; recency_wins only with reliable chronology |
+| Issue auto-resolution | LLM selects API actions | Fixed remediation allowlist (7 action types) |
 
-**LLM-optional** (MenteDB pattern): all operations degrade to rule-based fallbacks if the LLM endpoint is unavailable. The engine stays functional with no LLM.
-
-**Batch consolidation** (LycheeMemory V2 / RecMem): entries sent in batched LLM calls (≤30 per batch), not per-entry — 75-87% fewer LLM calls vs eager consolidation.
+**Key improvements over v2.x**:
+- Zero token cost, zero external API calls
+- Deterministic: identical input → identical output
+- Indexed candidate generation — no O(n²) pair comparison
+- Cross-batch dedup coverage (old LLM chunked approach missed duplicates across batches)
+- Timestamp safety: recall order never treated as chronological order
+- Transactional offload: failed L2 retains never cause L1 data loss
+- Dry-run mode and full audit logging
 
 **Non-destructive invalidation**: dedup and contradiction resolution use `PATCH {"state":"invalidated"}` (recall-hidden, retained on disk for audit). Never `DELETE`.
 
-## v2.2.1 — Safety Patch (Sep 2026)
-
-Addresses critical data-loss, LLM action safety, and validation issues identified in code review:
-
-| Priority | Issue | Fix |
-|----------|-------|-----|
-| **P0** | Failed offloads removed from MEMORY.md | Failed entries are always kept locally — only successfully-offloaded entries are removed |
-| **P0** | LLM auto-resolver could invalidate memories from unconstrained plan | Destructive actions (invalidate, config_tune) disabled by default — requires `--allow-destructive` flag |
-| **P0** | LLM indices insufficiently validated (negative indices, overlaps) | Strict validation: bounds, no negatives, no canonical-in-duplicates, no overlapping groups, invalid responses rejected entirely |
-| **P0** | Tags computed but never sent in retain body | Tags and stable `document_id` now included in Hindsight retain requests |
-| **P0** | Dedup canonical detection missed canonical==1 case | Fixed: entry is duplicate if `canonical==0 OR 0 in duplicates` |
-| **P0** | Observations return 400 on PATCH | `curate_memory()` fetches `fact_type` first; observations resolved via source memories |
-| **P0** | Telegram HTML not escaped | `html.escape()` on all dynamic content; delivery status reported accurately |
-| **P1** | Hardcoded `/root`, ports, limits | All paths/URLs/banks/caps configurable via environment variables (`HERMES_HOME`, `WIKI_DIR`, `HINDSIGHT_URL`, etc.) |
-| **P1** | No file lock — cron race risk | `FileLock` (fcntl.flock) prevents concurrent offload + daily runs |
-| **P1** | `st_size` bytes mixed with char limits | Consistent decoded character counting |
-| **P2** | Tests covered helpers but not destructive workflows | 72 tests: offload safety (partial/all-fail/all-success), LLM validation (negatives, overlaps, self-pairs), safe invalidation (fact_type), HTML escaping, destructive flag |
-| **P2** | No pyproject.toml, CI | Added `pyproject.toml`, GitHub Actions CI (ruff, mypy, bandit, pytest, Python 3.10-3.12) |
-
-**Safety invariant**: An entry may be removed from L1 only after durable L2 retention or verified existing L2 presence.
-
-**LLM-as-advisor model**: The LLM proposes actions, but destructive operations (invalidate, config_tune) require explicit opt-in via `--allow-destructive`. Consolidation (non-destructive) is always allowed. Config keys are allowlisted.
-
-## v2.3 — Correctness (Sep 2026)
-
-Replaces broad-recall sampling with structured, paginated, timestamped memory scanning:
-
-| Change | Old (v2.2.1) | New (v2.3) |
-|--------|-------------|-----------|
-| Memory scanning | One broad recall query (max 50) | Paginated `/memories/list` with scan cursor — every memory eventually examined |
-| Recency resolution | LLM guesses from list position / wording | Deterministic from `MemoryRecord.timestamp` metadata |
-| Cross-chunk comparison | `BATCH_SIZE=30` boundary — entry 29 vs 30 never compared | Cross-chunk candidate generation (entity + keyword + adjacent blocking) |
-| Memory records | Raw content strings | `MemoryRecord` dataclass: id, content, fact_type, state, date, occurred_start, tags, document_id, source_memory_ids |
-| Knowledge Pages is_stale | Always uses mental-model workaround for small KBs | Version-gated: trusts tree `is_stale` directly on Hindsight ≥0.9.1 (scope-aware), falls back for older versions |
-| Scan coverage | Top-50 from semantic recall | Cursor-based pagination across all valid world+experience memories (wraps around) |
-
-**New module**: `scripts/memory_records.py` — `MemoryRecord` dataclass, `list_memories()`, `get_scan_batch()`, `generate_candidate_pairs()`, `resolve_recency()`.
-
-## v2.4 — Productization (Sep 2026)
-
-CLI workflow, audit logging, and privacy controls:
-
-| Feature | Description |
-|---------|-------------|
-| `--dry-run` | Report issues without taking any action |
-| `--apply` | Apply all recommended actions (implies `--allow-destructive`) |
-| `--allow-destructive` | Enable LLM auto-mutation (invalidate, config_tune) |
-| `--restore MEMORY_ID` | Restore a previously invalidated memory from the audit log |
-| `--audit-log` | Print recent audit log entries |
-| JSON audit log | Before/after state for every mutation, stored as JSONL with rotation |
-| PII redaction | Email, phone, SSN, credit card, API keys, IP addresses redacted before cloud judging |
-| Sensitive tag exclusion | Memories tagged `secret`, `private`, `credential`, `password` excluded from judging |
-| `LLM_JUDGE_LOCAL_MODE` | Env var to enable local-model/private judging (warns if cloud endpoint configured) |
-
-**Privacy model**: `memory_records.prepare_for_judging()` filters sensitive records and redacts PII before any content reaches the LLM judge. Set `LLM_JUDGE_LOCAL_MODE=true` and `LLM_JUDGE_BASE_URL` to a local model server for fully private operation.
-
-### LLM-as-Judge architecture
+### Architecture
 
 ```mermaid
 flowchart LR
     subgraph Inputs
         MEM1[L1 Memory entries]
-        MEM2[L2 Hindsight recall<br/>max 50 memories]
+        MEM2[L2 Hindsight recall<br/>with metadata]
     end
 
-    subgraph Judge["llm_judge.py — google/gemini-2.5-flash-lite"]
-        IC[classify_importance<br/>batched, ≤30 entries/call]
-        SD[semantic_dedup<br/>near-duplicate groups]
-        CD[detect_contradictions<br/>entity-drift pairs]
-    end
-
-    subgraph Fallback["Rule-based fallback"]
-        FB1[prefix matching]
-        FB2[word overlap >60%]
-        FB3[keyword entity drift]
+    subgraph Heuristics["memory_heuristics.py — stdlib only"]
+        IC[classify_importance<br/>weighted scoring + hard rules]
+        SD[semantic_dedup<br/>exact + structured + lexical]
+        CD[detect_contradictions<br/>structured claim comparison]
     end
 
     subgraph Actions
@@ -116,33 +60,17 @@ flowchart LR
     MEM2 --> SD
     MEM2 --> CD
 
-    IC -- LLM available --> A1
-    SD -- LLM available --> VAL1[Validate indices<br/>bounds, no negatives,<br/>no overlaps]
-    CD -- LLM available --> VAL2[Validate pairs<br/>2 distinct indices,<br/>newer_index in pair]
-    VAL1 --> A2
-    VAL2 --> A3
-
-    IC -- LLM unavailable --> FB1
-    SD -- LLM unavailable --> FB2
-    CD -- LLM unavailable --> FB3
-
-    FB1 --> A1
-    FB2 --> A2
-    FB3 --> A3
+    IC --> A1
+    SD --> A2
+    CD --> A3
 
     classDef input fill:#1f2937,stroke:#6366f1,color:#e5e7eb
-    classDef judge fill:#1f2937,stroke:#10b981,color:#a7f3d0
-    classDef fallback fill:#1f2937,stroke:#f59e0b,color:#fbbf24
+    classDef heur fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef action fill:#1f2937,stroke:#3b82f6,color:#93c5fd
-    classDef validate fill:#1f2937,stroke:#ef4444,color:#fca5a5
     class MEM1,MEM2 input
-    class IC,SD,CD judge
-    class FB1,FB2,FB3 fallback
+    class IC,SD,CD heur
     class A1,A2,A3 action
-    class VAL1,VAL2 validate
 ```
-
-**Key design**: LLM-optional (MenteDB pattern) — every operation degrades to rule-based fallback if the LLM endpoint is unavailable. Batch consolidation (LycheeMemory V2) sends all entries in a single LLM call (≤30 per batch), reducing LLM calls 75-87% vs per-entry processing.
 
 ## Layer topology
 
@@ -181,14 +109,26 @@ All paths are dynamic — no hardcoded `/root`. The scripts resolve `~` via `os.
 | `HINDSIGHT_BANK` | `main` | Hindsight bank name |
 | `MEMORY_CHARS` | `2200` | L1 MEMORY.md char cap |
 | `USER_CHARS` | `1375` | L1 USER.md char cap |
+| `MEMORY_HEURISTICS_DRY_RUN` | (unset) | Set to `1` to enable dry-run mode |
 
-**LLM-as-judge** (v2.1+): the `llm_judge.py` module reads `OPENROUTER_API_KEY` from `~/.hermes/.env` and uses `google/gemini-2.5-flash-lite` by default — a lightweight reasoning model optimized for ultra-low latency and cost efficiency. Override via env: `LLM_JUDGE_MODEL`, `LLM_JUDGE_BASE_URL`, `LLM_JUDGE_API_KEY`. If no LLM is configured, all operations degrade to rule-based fallbacks. The `llm_status` reported by `memory_offload.py` now accurately reflects whether the LLM endpoint is actually reachable (via `is_llm_available()`), not just whether the module imported.
+### Optional configuration
+
+`~/.hermes/memory_heuristics.json` — user overrides for essential prefixes, offload patterns, and state attributes. Invalid configuration falls back to defaults with a warning.
+
+```json
+{
+  "essential_prefixes": ["Production API:", "Customer response policy:"],
+  "offload_patterns": ["\\bcompleted ticket\\b"],
+  "state_attributes": ["provider", "model", "url", "port", "version"],
+  "dry_run": false
+}
+```
 
 ## Procedure (summary)
 
 1. **Assess** — L1 capacity %, L2 node count + failed operations, L3 size
-2. **L1 prune + offload** — classify essential vs offloadable, dedup-check against L2, retain, batch-remove, densify
-3. **L2 maintenance** — semantic dedup pass, contradiction scan, consolidate + recall-verify, config tune
+2. **L1 prune + offload** — classify essential vs offloadable (weighted rules), dedup-check against L2, retain, batch-remove, densify
+3. **L2 maintenance** — heuristic dedup pass (exact + strong), contradiction scan, consolidate + recall-verify
 4. **L3 lint** — orphans, broken wikilinks, index drift, staleness, contradiction handling with provenance
 5. **Report** — per-layer changes + memory-health verdict
 
@@ -200,6 +140,7 @@ Full details, pitfalls, and API commands: see [SKILL.md](SKILL.md).
 - Semantic dedup typically shrinks polluted stores 30–40% with no information loss
 - Tiered TTL: immutable facts → infinite; procedural → months; preferences → weeks; transient → hours
 - Consolidation can over-prune — always recall-verify after triggering it
+- Deterministic rules eliminate runtime variability and token cost
 
 ## L2 ↔ L3 bridge (Aug 2026 research)
 
@@ -220,21 +161,34 @@ The repo ships the no-agent daily script (`scripts/daily_memory_optimization.py`
 2. Recall smoke-test (consolidation over-prune check)
 3. Retain smoke-test — `total_tokens > 0` proves fact extraction ran (health green ≠ writes working)
 4. Bank stats: node count + failed_operations trend vs last run
-5. **LLM semantic dedup pass** (v2.0): recall recent memories (max 50), LLM identifies near-duplicates, invalidate via PATCH (non-destructive). LLM-optional — skipped if LLM unavailable.
-6. **LLM contradiction scan** (v2.0): recall recent memories, LLM finds entity-drift pairs. Recency-wins invalidation for state changes; flag-for-human for stable conflicts.
-7. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
-8. L1 capacity check (≥90% warns / triggers Hindsight offload — now LLM-driven classification)
-9. L3 wiki lint-lite (≥5 pages >90 days stale warns)
-10. **LLM auto-resolve** (v2.2, updated v2.2.1): if any issues were collected, attempt to resolve them with `google/gemini-2.5-flash-lite` (one LLM call) — consolidate (always allowed), invalidate stale memories, or tune Hindsight config. **Destructive actions (invalidate, config_tune) are disabled by default** — pass `--allow-destructive` to enable. Config keys are allowlisted.
-11. **Telegram notification** (v2.2, updated v2.2.1): if any issues remain unresolved after the LLM attempt, send a DM to the user. HTML content is escaped. Delivery status is reported accurately (was always "sent" even on failure). Silent if all issues are resolved or no issues found.
+5. Remove expired smoke-test records (self-pollution cleanup)
+6. Remove meta-maintenance records (reports about past runs)
+7. **Heuristic dedup pass** (v3.0): exact (SHA-256) + strong (structured claim / high lexical threshold) duplicates detected across the full recall set; invalidated via PATCH (non-destructive)
+8. Re-fetch/filter invalidated records
+9. **Contradiction scan** (v3.0): structured claim extraction; recency_wins only for high-confidence state changes with reliable chronology; stable and uncertain conflicts flagged for human review
+10. Knowledge Pages health: warn when >50% of pages report `is_stale` (Hindsight ≥0.9; tree signal is bank-wide-approximate, so small KBs ≤25 pages get exact per-page mental-model checks; skipped silently on older versions)
+11. L1 capacity check (≥90% warns / triggers Hindsight offload — rule-based classification)
+12. L3 wiki lint-lite (≥5 pages >90 days stale warns)
+13. **Rule-based auto-resolve** (v3.0): if any issues were collected, attempt to resolve them with the fixed remediation allowlist (7 action types). Destructive actions (invalidate) are disabled by default — pass `--allow-destructive` or `--apply` to enable.
+14. **Telegram notification**: if any issues remain unresolved after rule-based remediation, send a DM to the user. HTML content is escaped. Delivery status is reported accurately. Silent if all issues are resolved or no issues found.
 
 Silent on success — output only when something needs attention. Deploy next to `memory_offload.py` in `~/.hermes/scripts/` and schedule as a no-agent cron.
+
+### CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Report issues without taking any action (also via `MEMORY_HEURISTICS_DRY_RUN=1`) |
+| `--apply` | Apply all recommended actions (implies `--allow-destructive`) |
+| `--allow-destructive` | Enable auto-mutation (invalidate) — default: disabled |
+| `--restore MEMORY_ID` | Restore a previously invalidated memory from the audit log |
+| `--audit-log` | Print recent audit log entries |
 
 ### Pipeline flowchart
 
 ```mermaid
 flowchart TD
-    START([Daily cron triggers<br/>8:00 AM SGT]) --> L2A[L2: POST /consolidate]
+    START([Daily cron triggers]) --> L2A[L2: POST /consolidate]
     L2A --> POLL{Operation<br/>completed?}
     POLL -- no, ≤8 min --> POLL
     POLL -- timeout / error --> ERR
@@ -242,7 +196,10 @@ flowchart TD
     L2B --> L2C[L2: Retain smoke-test<br/>success AND total_tokens > 0]
     L2C --> L2D[L2: Bank stats<br/>nodes > 0, failed_ops trend]
 
-    L2D --> KP{Hindsight ≥ 0.9?<br/>/knowledge-base/tree}
+    L2D --> CLEAN[Clean expired smoke-tests<br/>+ meta-maintenance records]
+    CLEAN --> DEDUP[Heuristic dedup pass<br/>exact + strong, cross-batch]
+    DEDUP --> CONTRA[Contradiction scan<br/>structured claims, recency_wins<br/>high-confidence only]
+    CONTRA --> KP{Hindsight ≥ 0.9?<br/>/knowledge-base/tree}
     KP -- "404 / < 0.9" --> L1A
     KP -- ok --> KP2{KB ≤ 25 pages?}
     KP2 -- yes --> KP3["Exact per-page check<br/>GET /mental-models/{id}"]
@@ -262,7 +219,7 @@ flowchart TD
     L3B -- no --> OUT{Any issues<br/>collected?}
     COLLECT --> OUT
 
-    OUT -- yes --> RESOLVE[LLM auto-resolve<br/>google/gemini-2.5-flash-lite one try]
+    OUT -- yes --> RESOLVE[Rule-based auto-resolve<br/>fixed allowlist, one pass]
     RESOLVE --> RESOLVED{All issues<br/>resolved?}
     RESOLVED -- yes --> SILENT([Silent: empty stdout<br/>exit 0])
     RESOLVED -- no --> TG([Send Telegram DM<br/>to user])
@@ -275,7 +232,7 @@ flowchart TD
     classDef resolve fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef done fill:#1f2937,stroke:#10b981,color:#a7f3d0
     classDef tg fill:#1f2937,stroke:#3b82f6,color:#93c5fd
-    class L2A,L2B,L2C,L2D,KP3,KP4,L1A,L3A,OFF,COLLECT layer
+    class L2A,L2B,L2C,L2D,CLEAN,DEDUP,CONTRA,KP3,KP4,L1A,L3A,OFF,COLLECT layer
     class POLL,KP,KP2,KP5,L1B,L3B,OUT,RESOLVED decision
     class ERR,RESOLVE warn
     class START,SILENT done
@@ -285,52 +242,12 @@ flowchart TD
 **Key invariants**
 - Health green ≠ writes working — the retain smoke-test (`total_tokens > 0`) catches silent LLM-layer failures
 - Exit 0 always; errors surface via stdout, never via nonzero exit
-- The script's own smoke-test retain means a small Knowledge Base always reads stale in the tree — hence the exact per-page mental-model check for KBs ≤ 25 pages
-- **LLM auto-resolve** (v2.2): the script tries to fix issues itself before bothering the user — only truly unresolved issues reach Telegram
-- **Safety invariant** (v2.2.1): an entry may be removed from L1 only after durable L2 retention or verified existing L2 presence — failed offloads are always kept locally
-- **LLM-as-advisor** (v2.2.1): destructive actions (invalidate, config_tune) require `--allow-destructive`; LLM indices are strictly validated (no negatives, no overlaps); observations are handled via source memories, not direct PATCH
-
-### Sample report (agent-driven run)
-
-The no-agent cron is silent on success, but the same pipeline can also run agent-driven with a full report. Example output from a real run (Aug 24, 2026):
-
-```text
-🧠 Daily Memory Optimization Report
-Run: 2026-08-24 (Mon, SGT) | Bank: hermes
-
-Step 0 — Assessment
-• L1 MEMORY.md: 85% (1,881/2,200) — ⚠️ over 75% threshold
-• L1 USER.md: 50% (700/1,375) — ✅ healthy
-• L2 Hindsight: 1,641 nodes, 351 failed ops — ⚠️ investigated
-• L3 Wiki: 204K, 31 .md files (28 content) — ✅ clean
-
-Step 1 — L1 Prune + Densify
-• 2 entries densified in one atomic batch (270→220 chars; L3 entry
-  reduced to path + skill reference — detail already in Hindsight)
-• MEMORY.md: 85% → 73% (−264 chars, −12%); USER.md unchanged
-• Remaining 9 entries all durable, high-signal conventions — no offload
-
-Step 2 — L2 Hindsight Maintenance
-• 351 failed ops: all 402 Insufficient credits from pre-key-rotation
-  window — no active failures ✅
-• 179 failed consolidations: same 402 window; POST /consolidate →
-  deduplicated: false (nothing pending) ✅
-• Post-consolidation recall-verify: PASS
-• Semantic dedup skipped (store cleaned Aug 12); no contradictions;
-  config already optimal
-
-Step 3 — L3 Wiki Lint
-• Orphans: 0 · Broken [[links]]: 0 · Frontmatter: 28/28 valid
-• Index: 28/28 · Staleness >90d: 0 · log.md: 39 entries
-• 1 flag: reference/data-analytics.md at 447 lines exceeds the
-  200-line guideline — held for user approval (6+ inbound links)
-
-Step 4 — Verdict: 🟢 STABLE
-No active contradictions, no pollution signals, recall precision
-intact across all three layers.
-```
-
-Key takeaway: the 402 error burst looked alarming in raw failed-op counts but was a resolved transient (expired credits) — the investigation step prevents false alarms, and the report ends with exactly one actionable item requiring human sign-off rather than auto-splitting a heavily linked wiki page.
+- Zero external chat-completion calls — all heuristics are deterministic and local
+- Safety invariant: an entry may be removed from L1 only after durable L2 retention or verified existing L2 presence
+- Conservative mutation: only exact and strong duplicates are auto-invalidated; possible duplicates are report-only
+- Timestamp safety: recall order is never treated as chronological order; recency_wins requires reliable timestamps or explicit transitions
+- Stable attributes (legal name, birth date) are never auto-resolved — always flagged for human review
+- Every mutation is logged to the audit log with rule ID, confidence, reason, and timestamp
 
 ## Sources
 
@@ -338,9 +255,6 @@ Key takeaway: the 402 error burst looked alarming in raw failed-op counts but wa
 - [Agent Memory Garbage Collection](https://tianpan.co/blog/2026-04-14-agent-memory-garbage-collection) (Apr 2026)
 - [Agent Memory vs RAG: What Breaks at Scale](https://ranksquire.com/2026/03/31/agent-memory-vs-rag-what-breaks-at-scale-2026/) (Mar 2026)
 - [Selective Retention and Forgetting Strategies](https://zylos.ai/en/research/2026-06-08-agent-memory-consolidation-selective-retention-forgetting/) (Zylos, Jun 2026)
-- [MenteDB llm_consolidation](https://docs.rs/mentedb/latest/mentedb/llm_consolidation/index.html) — LLM-as-judge for semantic dedup, LLM-optional design
-- [LycheeMemory V2](https://arxiv.org/html/2608.12990) — semantic segment-level consolidation, 86% fewer construction tokens
-- [RecMem](https://aclanthology.org/2026.findings-acl.1619/) (ACL 2026 Findings) — recurrence-based consolidation, 87% token reduction
 - [Human-Inspired Memory Architecture](https://arxiv.org/html/2605.08538v1) — dedup-based consolidation: 97.2% precision, 58% store reduction
 - [SCM: Sleep-Consolidated Memory](https://arxiv.org/html/2604.20943v1) — structured forgetting for LLM memory
 - [Agent Memory Techniques](https://github.com/NirDiamant/Agent_Memory_Techniques) — 30 runnable notebooks covering consolidation, compaction, forgetting

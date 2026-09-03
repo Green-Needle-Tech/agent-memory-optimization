@@ -1,73 +1,51 @@
 #!/usr/bin/env python3
-"""Daily memory optimization — L1/L2/L3 maintenance for Hermes Agent.
+"""Daily memory optimization — L1/L2/L3 maintenance for Hermes Agent (v3.0).
 
 no-agent cron script: stdout is delivered verbatim; empty stdout = silent.
 
+v3.0 (Sep 2026): LLM-as-judge replaced with deterministic rule-based
+heuristics (memory_heuristics.py). Zero external chat-completion calls.
+  - heuristic_dedup_pass: exact (SHA-256 of normalized content) + strong
+    (structured claim / high lexical threshold) duplicate detection,
+    indexed candidate generation — no O(n^2) matrix, cross-batch coverage
+  - heuristic_contradiction_scan: structured claim extraction; recency_wins
+    only with explicit transitions or reliable timestamps; stable and
+    uncertain conflicts flagged for human review, never auto-resolved
+  - try_resolve_issues_with_rules: fixed remediation allowlist — the LLM
+    resolver that could select arbitrary API actions (including
+    invalidation by recall query) is removed
+  - recall preserves id/content/created_at/updated_at/tags metadata
+  - structured Issue records (code/severity/message/context) — free-form
+    problem strings exist only at the output boundary
+  - dry-run mode (MEMORY_HEURISTICS_DRY_RUN=1 or --dry-run): analysis and
+    reporting only, no memory mutation
+  - audit log for every mutation (rule id, confidence, reason, timestamp)
+
 v2.3 (Sep 2026): Correctness — structured records, deterministic recency, paginated scanning.
-  - Structured MemoryRecord with timestamps and fact_type metadata
-  - Deterministic recency resolution from timestamps (not LLM list-position)
-  - Paginated /memories/list replaces broad recall (scan cursor for coverage)
-  - Cross-chunk candidate generation (BATCH_SIZE boundary fix)
-  - Version-gated Knowledge Pages is_stale behavior
-  - Idempotent document_id values for retains
+v2.2.1 (Sep 2026): Safety patch — fact_type-aware invalidation, Telegram
+HTML escaping, accurate delivery status, env-var config, atomic state writes.
+v2.0.1 (Aug 2026): self-pollution fixes — smoke-test retirement, meta-memory
+invalidation, shared recall set.
 
-v2.4 (Sep 2026): Productization — CLI workflow, audit logging, privacy.
-  - JSON audit log (before/after state, restore capability)
-  - Privacy/PII redaction before cloud judging
-  - --dry-run / --apply / --allow-destructive / --restore CLI modes
-  - Local-model/private judging support via env vars
-
-v2.2.1 (Sep 2026): Safety patch.
-  - LLM auto-mutation DISABLED by default (requires --allow-destructive flag)
-  - Safe memory invalidation: fetches fact_type before PATCH (observations
-    return 400 — now handled by finding and invalidating source memories)
-  - Telegram HTML content escaped (raw <, >, & caused delivery failure)
-  - Telegram delivery status reported accurately (was always "sent")
-  - Config via environment variables (no hardcoded /root paths)
-  - Character-count consistency (decoded chars, not st_size bytes)
-  - Atomic state-file writes
-
-v2.2 (Sep 2026): LLM auto-resolve + Telegram notification.
-  - After collecting issues, the script attempts to resolve them using
-    google/gemini-2.5-flash-lite (one LLM call): consolidate, invalidate stale memories,
-    or tune Hindsight config
-  - Issues the LLM cannot auto-resolve are sent as a Telegram DM notification
-  - Silent if all issues are resolved by the LLM or no issues found
-
-v2.0.1 (Aug 2026): self-pollution fixes from live-run false positives.
-  - Smoke-test probe memories are tagged and retired after 48h (30 had accumulated)
-  - Meta-memories (reports ABOUT past maintenance runs) invalidated on sight —
-    they previously flagged against every related fact, every day
-  - Exact-duplicate pre-pass before the LLM (verbatim copies need no judge)
-  - One shared recall set feeds both dedup and contradiction passes
-    (previously different queries meant duplicates never reached dedup)
-  - Contradiction prompt hardened: complementary pairs (policy vs capability)
-    are not conflicts; temporal markers route state changes to recency-wins
-  - Stable-conflict flags deduped across runs via fingerprint state file
-    (an unresolved flag reports once, not daily)
-
-v2.0 (Aug 2026): LLM-driven semantic dedup + contradiction detection.
-  - L2 semantic dedup pass via llm_judge.semantic_dedup() (replaces manual recall+overlap)
-  - L2 contradiction scan via llm_judge.detect_contradictions() (replaces manual scan)
-  - LLM-optional: degrades to rule-based if LLM unavailable
-  - Batch consolidation: all memories in one LLM call (LycheeMemory V2 pattern)
-
-Behavior (per memory-optimization skill v2.0.0):
+Behavior (per memory-optimization skill):
   L2 (Hindsight, any 0.8+; Knowledge Pages checks activate on 0.9+):
     1. POST /consolidate -> poll operation to terminal state (max 8 min)
     2. Recall smoke-test after consolidation (over-prune check)
     3. Retain smoke-test: success:true AND total_tokens>0
-       (health green != writes working — fact extraction is what silently fails)
     4. Bank stats: total_nodes>0, failed_operations trend vs last run
-    5. **NEW** LLM semantic dedup pass: recall recent memories, LLM identifies
-       near-duplicates, invalidate via PATCH (non-destructive: state=invalidated)
-    6. **NEW** LLM contradiction scan: recall recent memories, LLM finds entity-drift
-       pairs, apply recency-wins invalidation (state changes) or flag for human review
-    7. Knowledge Pages tree: count pages + is_stale pages (0.9+ only)
+    5. Remove expired smoke-test records
+    6. Remove known meta-maintenance records
+    7. Heuristic dedup (exact + strong), invalidate via PATCH
+    8. Re-fetch/filter invalidated records
+    9. Structured contradiction detection
+   10. Apply high-confidence recency_wins only; report the rest
+    11. Knowledge Pages tree: count pages + is_stale pages (0.9+ only)
   L1 (local memory):
-    8. MEMORY.md / USER.md capacity check; >=90% triggers Hindsight offload
+    12. MEMORY.md / USER.md capacity check; >=90% triggers Hindsight offload
   L3 (LLM wiki / OKF bundle):
-    9. Wiki lint-lite: stale-page count (>90 days) on ~/.hermes/kb
+    13. Wiki lint-lite: stale-page count (>90 days)
+  14. Deterministic remediation rules (allowlist)
+  15. Telegram notification for unresolved issues
 
 Output only when something needs attention; else silent. Exit 0 always
 (a crash is reported via stdout, never via nonzero exit).
@@ -75,7 +53,7 @@ Output only when something needs attention; else silent. Exit 0 always
 
 import argparse
 import contextlib
-import hashlib
+import dataclasses
 import html
 import json
 import os
@@ -88,13 +66,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# LLM judge module (LLM-optional — degrades to rule-based if unavailable)
+# Rule-based heuristics module (v3.0 — replaces llm_judge entirely)
 sys.path.insert(0, str(Path(__file__).parent))
-llm_judge: types.ModuleType | None
-try:
-    import llm_judge
-except ImportError:
-    llm_judge = None  # standalone run: skip LLM-driven steps
+import memory_heuristics  # noqa: E402  (always available — ships with this repo)
 
 # v2.3: structured memory records, paginated listing, candidate generation
 memory_records: types.ModuleType | None
@@ -133,11 +107,11 @@ KP_STALE_RATIO_WARN = 0.5    # warn when >50% of knowledge pages are stale
 KP_EXACT_CHECK_MAX = 25      # use exact per-page mental-model is_stale for KBs up to this size
 STATE_FILE = HERMES_HOME / "scripts" / ".daily_memory_opt_state.json"
 
-# LLM-driven dedup/contradiction settings
-DEDUP_RECALL_LIMIT = 50      # max memories to recall for LLM dedup/contradiction scan
+# Heuristic dedup/contradiction settings
+DEDUP_RECALL_LIMIT = 50      # max memories to recall for dedup/contradiction scan
 DEDUP_RECALL_TOKENS = 3000   # token budget for recall query
 
-# v2.2.1: LLM auto-mutation disabled by default — requires --allow-destructive
+# v2.2.1: destructive mutation disabled by default — requires --allow-destructive
 ALLOW_DESTRUCTIVE = False
 
 # v2.0.1: self-pollution guards
@@ -162,6 +136,28 @@ TG_MAX_MSG_LEN = 4000   # Telegram message limit is 4096; keep margin
 # v2.4: Constants for previously-duplicated literals (SonarCloud design issues)
 META_NOISE_REASON = "meta_noise: report about a past maintenance run"
 ISO_TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"
+
+
+# === Structured issues (v3.0 spec section 10) ===
+
+@dataclasses.dataclass
+class Issue:
+    """Structured maintenance issue. Rendering to text happens only at the
+    output boundary (render_issue)."""
+    code: str
+    severity: str            # "info" | "warning" | "critical"
+    message: str
+    context: dict = dataclasses.field(default_factory=dict)
+    auto_resolvable: bool = False
+
+
+def render_issue(issue: Issue) -> str:
+    """Render an Issue to human-readable text (output boundary only)."""
+    detail = ""
+    if issue.context:
+        parts = [f"{k}={v}" for k, v in issue.context.items()]
+        detail = f" ({', '.join(parts)})"
+    return f"{issue.message}{detail}"
 
 
 def _read_env_var(var_name):
@@ -198,12 +194,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _escape_html(text: str) -> str:
-    """Escape HTML special characters for Telegram parse_mode=HTML.
-
-    v2.2.1: Raw <, >, & in issue text caused Telegram delivery failure
-    or malformed output. html.escape handles all three + quotes.
-    """
+    """Escape HTML special characters for Telegram parse_mode=HTML."""
     return html.escape(text, quote=False)
+
+
+def _is_dry_run(args) -> bool:
+    """Dry-run is active via CLI flag or MEMORY_HEURISTICS_DRY_RUN env/config."""
+    return bool(getattr(args, "dry_run", False)) or memory_heuristics.is_dry_run()
 
 
 # === Safe memory invalidation (v2.2.1) ===
@@ -220,7 +217,7 @@ def _get_memory(mid):
 def curate_memory(memory_id, action="invalidate", reason=""):
     """Safe memory curation: invalidates a memory after checking fact_type.
 
-    v2.2.1: Only world and experience memories can be directly invalidated.
+    Only world and experience memories can be directly invalidated.
     Observations are derived — PATCH returns 400. For observations, we
     find and invalidate their source memories instead.
 
@@ -253,7 +250,7 @@ def curate_memory(memory_id, action="invalidate", reason=""):
 
 
 def _patch_invalidate(mid, reason=""):
-    """Direct PATCH invalidation (world/experience only)."""
+    """Direct PATCH invalidation (world/experience only). Never DELETE."""
     try:
         http("PATCH", f"/v1/default/banks/{BANK}/memories/{mid}", timeout=120,
              body={"state": "invalidated", "reason": reason})
@@ -265,149 +262,103 @@ def _patch_invalidate(mid, reason=""):
 def invalidate_memory(mid, reason="duplicate"):
     """Non-destructive invalidation with fact_type safety check.
 
-    v2.2.1: Wraps curate_memory() to add fact_type checking. Observations
-    are handled by invalidating their source memories. Never DELETE —
-    invalidation preserves audit trail and is recoverable.
+    Observations are handled by invalidating their source memories.
+    Never DELETE — invalidation preserves audit trail and is recoverable.
     """
     return curate_memory(mid, action="invalidate", reason=reason)
 
 
-# Allowlisted config keys (v2.2.1: prevent arbitrary config mutation)
-ALLOWED_CONFIG_KEYS = {
-    "recall_budget_function", "recall_max_tokens",
-    "consolidation_max_memories_per_round",
-    "retain_mission", "reflect_mission",
-    "enable_auto_consolidation",
+# === Deterministic remediation rules (v3.0 spec section 11) ===
+# Fixed allowlist: the LLM resolver that could select arbitrary API
+# actions (including invalidation by arbitrary recall query) is removed.
+# Everything outside this allowlist remains unresolved and is sent
+# through the notification path.
+
+RULE_REMEDIATIONS = {
+    "L2_CONSOLIDATION_PENDING": "trigger_consolidation",
+    "L1_CAPACITY_EXCEEDED": "run_memory_offload",
+    "SMOKE_TEST_EXPIRED": "invalidate_exact_memory_id",
+    "META_MEMORY_FOUND": "invalidate_exact_memory_id",
+    "EXACT_DUPLICATE": "invalidate_exact_memory_id",
+    "STRONG_DUPLICATE": "invalidate_exact_memory_id",
+    "STATE_CHANGE_HIGH_CONFIDENCE": "invalidate_exact_older_memory_id",
 }
 
 
-def _build_resolver_prompts(problems):
-    """Build system and user prompts for the LLM resolver."""
-    system_prompt = (
-        "You are a memory maintenance resolver for a three-layer AI agent memory system.\n"
-        "L1 = local MEMORY.md/USER.md (always injected, char-capped).\n"
-        "L2 = Hindsight server (semantic recall, consolidation, Knowledge Pages).\n"
-        "L3 = LLM Wiki (git-versioned markdown knowledge base).\n\n"
-        "You receive a list of issues found during daily maintenance.\n"
-        "For each issue, decide if it can be auto-resolved with an API action.\n"
-        "Available actions:\n"
-        '  - {"action": "consolidate"} — POST /consolidate to trigger Hindsight consolidation\n'
-        '  - {"action": "invalidate", "reason": "...", "query": "search terms"} — recall memories\n'
-        '    matching query, invalidate the stale ones (PATCH state=invalidated)\n'
-        '  - {"action": "config_tune", "key": "...", "value": "..."} — PATCH /config\n'
-        '  - {"action": "skip"} — cannot auto-resolve, needs human review\n\n'
-        "Return a JSON array of objects, one per issue:\n"
-        '  {"issue_index": 0, "action": "consolidate|invalidate|config_tune|skip",\n'
-        '   "reason": "brief explanation", "query": "optional search terms",\n'
-        '   "key": "optional config key", "value": "optional config value"}\n'
-        "Respond with ONLY the JSON array, no other text."
-    )
-    issue_list = "\n".join(f"  [{i}] {p}" for i, p in enumerate(problems))
-    user_prompt = f"Issues found during daily memory optimization:\n{issue_list}\n\nReturn the JSON action plan."
-    return system_prompt, user_prompt
+def try_resolve_issues_with_rules(issues):
+    """Apply the fixed remediation allowlist to structured issues.
 
-
-def _execute_resolve_action(item, issue):
-    """Execute a single LLM-proposed resolve action. Returns resolution string or None (unresolved)."""
-    action = item.get("action", "skip")
-
-    # Consolidate is always safe (non-destructive)
-    if action == "consolidate":
-        try:
-            http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
-            return f"{issue} → resolved (consolidation triggered)"
-        except Exception:
-            return None
-
-    # Destructive actions require --allow-destructive flag (v2.2.1)
-    if action == "invalidate" and ALLOW_DESTRUCTIVE:
-        return _execute_invalidate_action(item, issue)
-
-    if action == "config_tune" and ALLOW_DESTRUCTIVE:
-        return _execute_config_tune_action(item, issue)
-
-    # skip, unknown, or destructive action without --allow-destructive
-    return None
-
-
-def _execute_invalidate_action(item, issue):
-    """Execute an invalidate action. Returns resolution string or None."""
-    query = item.get("query", "")
-    reason = item.get("reason", "stale memory invalidated by LLM resolver")
-    if not query:
-        return None
-    memories = recall_recent_memories(query=query, limit=10)
-    invalidated = sum(1 for m in memories if invalidate_memory(m["id"], reason))
-    if invalidated > 0:
-        return f"{issue} → resolved ({invalidated} memories invalidated)"
-    return None
-
-
-def _execute_config_tune_action(item, issue):
-    """Execute a config_tune action. Returns resolution string or None."""
-    key = item.get("key", "")
-    value = item.get("value", "")
-    # v2.2.1: allowlist config keys
-    if not key or key not in ALLOWED_CONFIG_KEYS:
-        return None
-    try:
-        http("PATCH", f"/v1/default/banks/{BANK}/config", timeout=120,
-             body={"updates": {key: value}})
-        return f"{issue} → resolved (config {key}={value})"
-    except Exception:
-        return None
-
-
-def try_resolve_issues_with_llm(problems):
-    """Attempt to resolve collected issues using google/gemini-2.5-flash-lite (one try).
-
-    v2.2.1: LLM auto-mutation is DISABLED by default. The LLM is used as
-    an ADVISOR only — it proposes actions, but destructive actions
-    (invalidate, config_tune) are only executed if ALLOW_DESTRUCTIVE is True.
-    Consolidation (non-destructive) is always allowed.
-
-    Sends the issue list to the LLM with context about the memory system
-    and available Hindsight API operations. The LLM returns a JSON action
-    plan; each action is validated against a typed policy before execution.
+    The resolver must not:
+    - Search arbitrary text and invalidate all recall matches
+    - Change unknown Hindsight configuration keys
+    - Resolve stable conflicts
+    - Modify L3 content
+    - Execute actions based on generated natural-language instructions
 
     Returns (resolved_issues, unresolved_issues) lists.
     """
-    if llm_judge is None:
-        return [], list(problems)
+    resolved, unresolved = [], []
+    for issue in issues:
+        action = RULE_REMEDIATIONS.get(issue.code)
+        if action is None:
+            unresolved.append(issue)
+            continue
+        result = _execute_rule_remediation(issue, action)
+        if result is not None:
+            resolved.append(result)
+        else:
+            unresolved.append(issue)
+    return resolved, unresolved
 
-    system_prompt, user_prompt = _build_resolver_prompts(problems)
 
+def _execute_rule_remediation(issue: Issue, action: str):
+    """Execute one allowlisted remediation. Returns resolution text or None."""
     try:
-        response = llm_judge._llm_chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=3000,
-        )
-        if not response:
-            return [], list(problems)
+        if action == "trigger_consolidation":
+            http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
+            return f"{render_issue(issue)} → resolved (consolidation triggered)"
 
-        plan = llm_judge._parse_json_response(response)
-        if not plan or not isinstance(plan, list):
-            return [], list(problems)
+        if action == "run_memory_offload":
+            if memory_offload is None:
+                return None
+            used_before, _ = memory_offload.get_memory_usage()
+            memory_offload.main()
+            used_after, _ = memory_offload.get_memory_usage()
+            if used_after < used_before:
+                return (f"{render_issue(issue)} → resolved "
+                        f"(offloaded, now {used_after} chars)")
+            return None
 
-        resolved, unresolved = [], []
-        for item in plan:
-            idx = item.get("issue_index", -1)
-            if not isinstance(idx, int) or idx < 0 or idx >= len(problems):
-                continue
-            issue = problems[idx]
-            result = _execute_resolve_action(item, issue)
-            if result:
-                resolved.append(result)
-            else:
-                unresolved.append(issue)
+        if action == "invalidate_exact_memory_id":
+            mid = issue.context.get("memory_id")
+            if not mid or not ALLOW_DESTRUCTIVE:
+                return None
+            if invalidate_memory(mid, reason=issue.code.lower()):
+                memory_heuristics.audit_log(
+                    operation="invalidate", memory_id=mid,
+                    rule=issue.code, confidence="high",
+                    reason=issue.message,
+                )
+                return f"{render_issue(issue)} → resolved (invalidated {mid[:12]}…)"
+            return None
 
-        return resolved, unresolved
+        if action == "invalidate_exact_older_memory_id":
+            mid = issue.context.get("older_memory_id")
+            if not mid or not ALLOW_DESTRUCTIVE:
+                return None
+            if invalidate_memory(mid, reason="superseded_state_change"):
+                memory_heuristics.audit_log(
+                    operation="invalidate", memory_id=mid,
+                    rule=issue.code, confidence="high",
+                    reason=issue.message,
+                    replacement_id=issue.context.get("newer_memory_id"),
+                )
+                return f"{render_issue(issue)} → resolved (invalidated older {mid[:12]}…)"
+            return None
 
+        return None  # unknown action — never guess
     except Exception:
-        return [], list(problems)
+        return None
 
 
 def send_telegram_notification(text):
@@ -415,19 +366,13 @@ def send_telegram_notification(text):
 
     Reads TELEGRAM_BOT_TOKEN and TELEGRAM_HOME_CHANNEL from ~/.hermes/.env.
     Returns True on success, False on failure (silent — never crash the cron).
-
-    v2.2.1: HTML content is now escaped (raw <, >, & caused delivery failure
-    or malformed output). The caller now checks the return value to report
-    delivery status accurately.
     """
     bot_token = _read_env_var("TELEGRAM_BOT_TOKEN")
     chat_id = _read_env_var("TELEGRAM_HOME_CHANNEL")
     if not bot_token or not chat_id:
         return False
 
-    # v2.2.1: escape HTML special characters in issue text
-    # Keep our own <b>, <i>, <br/> tags — escape only the dynamic content
-    # The caller is responsible for using escaped text in the body.
+    # HTML content is escaped by the caller; only our own tags are raw
     if len(text) > TG_MAX_MSG_LEN:
         text = text[:TG_MAX_MSG_LEN - 20] + "\n\n…(truncated)"
 
@@ -471,9 +416,14 @@ def walk_tree(nodes):
 
 
 def recall_recent_memories(query="user preferences, environment, configuration, tools", limit=None):
-    """Recall recent memories for LLM-driven dedup + contradiction scan.
+    """Recall recent memories for heuristic dedup + contradiction scan.
 
-    Returns list of {id, content} dicts, or empty list on failure.
+    v3.0: preserves metadata — id, content, created_at, updated_at, tags.
+    The contradiction detector must receive these records, not only
+    content strings (timestamp safety: recall order is never treated as
+    chronological order; timestamps come from metadata).
+
+    Returns list of record dicts, or empty list on failure.
     """
     try:
         _, resp = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=120,
@@ -484,32 +434,32 @@ def recall_recent_memories(query="user preferences, environment, configuration, 
             mid = h.get("id") or h.get("memory_id")
             content = h.get("content", "") or h.get("text", "")
             if mid and content:
-                memories.append({"id": mid, "content": content})
+                memories.append({
+                    "id": mid,
+                    "content": content,
+                    "created_at": h.get("created_at"),
+                    "updated_at": h.get("updated_at") or h.get("edited_at") or h.get("date"),
+                    "tags": h.get("tags", []),
+                })
         return memories[:(limit or DEDUP_RECALL_LIMIT)]
     except Exception:
         return []
 
 
 def recall_all_recent(limit=DEDUP_RECALL_LIMIT):
-    """Recall a broad mix of recent memories (single shared set for dedup + contradictions).
-
-    v2.0.1: dedup and contradiction scans previously used different recall queries,
-    so duplicates the contradiction scan saw never reached the dedup pass. One
-    broad recall now feeds both passes, keeping indices consistent.
-    """
+    """Recall a broad mix of recent memories (single shared set for dedup + contradictions)."""
     return recall_recent_memories(
         query="user preferences, environment, configuration, tools, versions, migrations, decisions",
         limit=limit,
     )
 
 
-def cleanup_smoke_tests(problems):
+def cleanup_smoke_tests(issues):
     """Invalidate old smoke-test memories (v2.0.1 self-pollution fix).
 
-    The retain smoke-test writes a memory every run; without cleanup they
-    accumulate forever (30 found in one bank). Each new smoke-test memory is
-    tagged SMOKE_TEST_TAG; anything tagged and older than SMOKE_TEST_MAX_AGE_S
-    is invalidated. Legacy untagged ones are matched by content prefix.
+    Each new smoke-test memory is tagged SMOKE_TEST_TAG; anything tagged
+    and older than SMOKE_TEST_MAX_AGE_S is invalidated. Legacy untagged
+    ones are matched by content prefix.
     """
     cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - SMOKE_TEST_MAX_AGE_S))
     removed = 0
@@ -527,51 +477,203 @@ def cleanup_smoke_tests(problems):
             m = re.search(r"smoke test (\d{4}-\d{2}-\d{2})", content)
             if m and m.group(1) > cutoff:
                 continue  # recent — keep (it's this run's probe)
-            if invalidate_memory(h.get("id") or h.get("memory_id"), reason="smoke_test_junk"):
+            mid = h.get("id") or h.get("memory_id")
+            if mid and invalidate_memory(mid, reason="smoke_test_junk"):
                 removed += 1
+                memory_heuristics.audit_log(
+                    operation="invalidate", memory_id=mid,
+                    rule="SMOKE_TEST_EXPIRED", confidence="high",
+                    reason="expired smoke-test record",
+                )
     except Exception:
         return  # cleanup is best-effort; never block the run
     if removed:
-        problems.append(f"Self-pollution cleanup: {removed} old smoke-test memories invalidated")
+        issues.append(Issue(
+            code="SMOKE_TEST_CLEANUP", severity="info",
+            message=f"Self-pollution cleanup: {removed} old smoke-test memories invalidated",
+        ))
 
 
-def invalidate_meta_memories(memories, problems):
+def invalidate_meta_memories(memories, issues):
     """Invalidate meta-memories: reports ABOUT past maintenance runs (v2.0.1).
 
-    Past runs' problem reports were retained as memories ("a stable-attribute
-    conflict was flagged regarding X"). Those reports then flag against every
-    related fact on every subsequent run — self-referential noise. They are
-    bookkeeping, not facts; invalidate on sight.
+    Past runs' problem reports were retained as memories. Those reports
+    then flag against every related fact on every subsequent run —
+    self-referential noise. They are bookkeeping, not facts; invalidate
+    on sight.
     """
     removed = 0
     for m in memories:
-        if META_MEMORY_RE.search(m.get("content", "")) and invalidate_memory(
-            m["id"], reason=META_NOISE_REASON
-        ):
-            removed += 1
-    if removed:
-        problems.append(f"Self-pollution cleanup: {removed} meta-memories (reports about past runs) invalidated")
-    return removed
-
-
-def exact_duplicate_prepass(memories):
-    """Invalidate verbatim duplicates before the LLM passes (v2.0.1).
-
-    Exact copies (same normalized content) need no LLM call — collapse them
-    deterministically, keeping the first occurrence. Returns count removed.
-    """
-    seen = {}
-    removed = 0
-    for m in memories:
-        key = hashlib.sha256(
-            re.sub(r"\s+", " ", m["content"]).strip().lower().encode()
-        ).hexdigest()
-        if key in seen:
-            if invalidate_memory(m["id"], reason="exact_duplicate"):
+        if META_MEMORY_RE.search(m.get("content", "")):
+            if invalidate_memory(m["id"], reason=META_NOISE_REASON):
                 removed += 1
-        else:
-            seen[key] = m["id"]
+                memory_heuristics.audit_log(
+                    operation="invalidate", memory_id=m["id"],
+                    rule="META_MEMORY_FOUND", confidence="high",
+                    reason=META_NOISE_REASON,
+                )
+    if removed:
+        issues.append(Issue(
+            code="META_MEMORY_CLEANUP", severity="info",
+            message=f"Self-pollution cleanup: {removed} meta-memories "
+                    f"(reports about past runs) invalidated",
+        ))
     return removed
+
+
+# === Heuristic dedup pass (v3.0 — replaces llm_semantic_dedup_pass) ===
+
+def heuristic_dedup_pass(issues, memories=None):
+    """Rule-based semantic dedup pass (exact + strong, v3.0).
+
+    v3.0 spec section 10:
+      - Uses memory_heuristics.semantic_dedup() over the full input set —
+        duplicates across different recall batches ARE detected (the old
+        LLM chunked approach compared only within 30-entry batches).
+      - Indexed candidate generation — no unrestricted O(n^2) comparison.
+      - Only exact and strong groups are invalidated; "possible" groups
+        are reported only.
+      - Dry-run: prints proposed actions with rule identifiers, no mutation.
+
+    Research basis:
+    - Hindsight blog: fact deduplication — "same claim, different wording"
+    - Human-Inspired Memory: dedup-based consolidation achieves 97.2%
+      precision, 58% store reduction
+    """
+    if memories is None:
+        memories = recall_all_recent()
+    if len(memories) < 2:
+        return
+
+    dup_groups = memory_heuristics.semantic_dedup(memories)
+    invalidated = 0
+    possible_reported = 0
+
+    for group in dup_groups:
+        confidence = group.get("confidence")
+        if confidence not in ("exact", "strong"):
+            possible_reported += 1
+            continue
+        for dup_idx in group["duplicates"]:
+            if not (0 <= dup_idx < len(memories)):
+                continue
+            mid = memories[dup_idx]["id"]
+            reason = f"duplicate of {memories[group['canonical']]['id'][:12]}… ({group['rule']})"
+            if _is_dry_run(_current_args):
+                print(f"DRY RUN: would invalidate memory {mid}")
+                print(f"  Rule: {group['rule']}")
+                print(f"  Canonical: {memories[group['canonical']]['id']}")
+                print(f"  Reason: {group['reason']}")
+                continue
+            if memory_records is not None:
+                memory_records.append_audit_log(memory_records.AuditEntry(
+                    timestamp=time.strftime(ISO_TIMESTAMP_FMT, time.gmtime()),
+                    action="invalidate",
+                    memory_id=mid,
+                    reason=reason,
+                ))
+            if invalidate_memory(mid, reason=reason):
+                memory_heuristics.audit_log(
+                    operation="invalidate", memory_id=mid,
+                    rule=group["rule"], confidence=confidence,
+                    reason=group["reason"],
+                    replacement_id=memories[group["canonical"]]["id"],
+                )
+                invalidated += 1
+
+    if invalidated > 0:
+        issues.append(Issue(
+            code="STRONG_DUPLICATE" if invalidated else "EXACT_DUPLICATE",
+            severity="info",
+            message=f"Heuristic dedup: {invalidated} duplicate memories invalidated "
+                    f"(non-destructive — retained on disk for audit)",
+            context={"scanned": len(memories), "auto_resolvable": True},
+        ))
+    if possible_reported > 0:
+        issues.append(Issue(
+            code="POSSIBLE_DUPLICATE_REPORT", severity="info",
+            message=f"Heuristic dedup: {possible_reported} possible (report-only) "
+                    f"duplicate groups found — no action taken",
+        ))
+
+
+# === Heuristic contradiction scan (v3.0 — replaces llm_contradiction_scan) ===
+
+def heuristic_contradiction_scan(issues, memories=None):
+    """Rule-based structured contradiction detection (v3.0).
+
+    v3.0 spec sections 9-10:
+      - Structured claim extraction; only reliably-parsed claims compared.
+      - recency_wins applied ONLY for high-confidence results (explicit
+        transitions or reliable timestamps). Recall order is never
+        treated as chronological order.
+      - Stable and uncertain conflicts are reported (flag_human), never
+        auto-resolved.
+      - Complementary facts are not contradictions.
+    """
+    if memories is None:
+        memories = recall_all_recent()
+    if len(memories) < 2:
+        return
+
+    contradictions = memory_heuristics.detect_contradictions(memories)
+    invalidated = 0
+    flagged = 0
+    prev_flags = load_flag_state()
+    new_flags = set()
+
+    for c in contradictions:
+        pair = c["pair"]
+        if not (0 <= pair[0] < len(memories) and 0 <= pair[1] < len(memories)):
+            continue
+
+        resolution = c.get("resolution", "flag_human")
+
+        if resolution == "recency_wins" and c.get("confidence") == "high":
+            older_idx = c.get("older_index")
+            if older_idx is None or not (0 <= older_idx < len(memories)):
+                continue
+            older = memories[older_idx]
+            newer_id = memories[pair[0] if pair[1] == older_idx else pair[1]]["id"]
+            if _is_dry_run(_current_args):
+                print(f"DRY RUN: would invalidate older memory {older['id']}")
+                print(f"  Rule: {c['rule']}")
+                print(f"  Replacement: {newer_id}")
+                print(f"  Reason: {c['reason']}")
+                continue
+            if invalidate_memory(older["id"], reason=f"superseded: {c['reason']}"):
+                memory_heuristics.audit_log(
+                    operation="invalidate", memory_id=older["id"],
+                    rule=c["rule"], confidence="high",
+                    reason=c["reason"], replacement_id=newer_id,
+                )
+                invalidated += 1
+        else:
+            # flag_human — report once per pair (fingerprint state file)
+            pair_contents = [memories[pair[0]]["content"], memories[pair[1]]["content"]]
+            fp = flag_fingerprint(pair_contents)
+            if fp in prev_flags:
+                continue
+            new_flags.add(fp)
+            flagged += 1
+            issues.append(Issue(
+                code="CONFLICT_FLAG_HUMAN", severity="warning",
+                message=f"Contradiction scan: {c['type']} needs review — "
+                        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({c['reason']})",
+                context={"rule": c["rule"], "resolution": resolution},
+            ))
+
+    if invalidated > 0:
+        issues.append(Issue(
+            code="STATE_CHANGE_HIGH_CONFIDENCE", severity="info",
+            message=f"Contradiction scan: {invalidated} stale state-change memories "
+                    f"invalidated (recency-wins, high confidence only)",
+            auto_resolvable=True,
+        ))
+    if new_flags:
+        save_flag_state(prev_flags | new_flags)
+    if flagged and not invalidated:
+        pass  # flag issues already appended above
 
 
 def load_flag_state():
@@ -591,351 +693,8 @@ def save_flag_state(flags):
 def flag_fingerprint(pair_contents):
     """Stable fingerprint for a flagged pair (order-independent, content-based)."""
     a, b = sorted(pair_contents)
+    import hashlib
     return hashlib.sha256(f"{a}||{b}".encode()).hexdigest()
-
-
-def _dedup_invalidate_records(records, dup_groups, problems, total_source):
-    """Invalidate duplicate memories from structured records (v2.3 path)."""
-    invalidated = 0
-    for group in dup_groups:
-        for dup_idx in group["duplicates"]:
-            if not (0 <= dup_idx < len(records)):
-                continue
-            mid = records[dup_idx].id
-            # v2.4: audit log
-            if memory_records is not None:
-                memory_records.append_audit_log(memory_records.AuditEntry(
-                    timestamp=time.strftime(ISO_TIMESTAMP_FMT, time.gmtime()),
-                    action="invalidate",
-                    memory_id=mid,
-                    before_state={"state": records[dup_idx].state, "fact_type": records[dup_idx].fact_type},
-                    reason="semantic_duplicate",
-                ))
-            if invalidate_memory(mid, reason="semantic_duplicate"):
-                invalidated += 1
-    if invalidated > 0:
-        problems.append(
-            f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
-            f"(non-destructive — retained on disk for audit). "
-            f"Scanned {len(records)}/{total_source} source memories (cursor-based)."
-        )
-
-
-def _dedup_invalidate_recall(memories, dup_groups, problems):
-    """Invalidate duplicate memories from recall-based approach (v2.0 path)."""
-    invalidated = 0
-    for group in dup_groups:
-        for dup_idx in group["duplicates"]:
-            if 0 <= dup_idx < len(memories):
-                mid = memories[dup_idx]["id"]
-                if invalidate_memory(mid, reason="semantic_duplicate"):
-                    invalidated += 1
-    if invalidated > 0:
-        problems.append(
-            f"LLM semantic dedup: {invalidated} near-duplicate memories invalidated "
-            f"(non-destructive — retained on disk for audit)"
-        )
-
-
-def llm_semantic_dedup_pass(problems, memories=None):
-    """LLM-driven semantic dedup pass (Step 5, new in v2.0).
-
-    v2.3: Uses paginated /memories/list instead of one broad recall query.
-    Cross-chunk candidate generation fixes the BATCH_SIZE boundary problem.
-    Privacy redaction applied before sending to cloud judge.
-
-    v2.0.1: accepts a pre-recalled shared memory list (same set feeds the
-    contradiction scan, keeping indices consistent).
-
-    Research basis:
-    - MenteDB llm_consolidation: LLM-as-judge for semantic dedup
-    - Hindsight blog: fact deduplication — "same claim, different wording"
-    - Human-Inspired Memory: dedup-based consolidation achieves 97.2% precision, 58% store reduction
-    """
-    if llm_judge is None:
-        return  # LLM unavailable — skip (rule-based dedup happens in Hindsight's own consolidation)
-
-    # v2.3: use structured records from /memories/list when available
-    if memory_records is not None:
-        records, total_source, new_offset = memory_records.get_scan_batch()
-        if len(records) < 2:
-            return  # nothing to dedup
-
-        # Save scan cursor for next run
-        memory_records.save_scan_cursor({
-            "offset": new_offset,
-            "total_seen": memory_records.load_scan_cursor().get("total_seen", 0) + len(records),
-        })
-
-        # Generate cross-chunk candidate pairs (fixes BATCH_SIZE boundary)
-        candidates = memory_records.generate_candidate_pairs(records)
-        if not candidates:
-            return  # no candidates to check
-
-        # Prepare safe records for LLM judging (PII redacted)
-        safe_records = memory_records.prepare_for_judging(records)
-        contents = [r["content"] for r in safe_records]
-        dup_groups = llm_judge.semantic_dedup(contents)
-        _dedup_invalidate_records(records, dup_groups, problems, total_source)
-        return
-
-    # Fallback: old recall-based approach (v2.0)
-    if memories is None:
-        memories = recall_all_recent()
-    if len(memories) < 2:
-        return  # nothing to dedup
-
-    contents = [m["content"] for m in memories]
-    dup_groups = llm_judge.semantic_dedup(contents)
-    _dedup_invalidate_recall(memories, dup_groups, problems)
-
-
-def _normalize_text(s):
-    return re.sub(r"\s+", " ", s).strip().lower()
-
-
-def _handle_recency_wins_records(records, pair, reason, prev_flags, new_flags, problems):
-    """Handle a recency_wins contradiction pair using structured records. Returns (invalidated, flagged)."""
-    rec_a = records[pair[0]]
-    rec_b = records[pair[1]]
-    newer, older = memory_records.resolve_recency((rec_a, rec_b))
-
-    if older is not None:
-        # Deterministic recency — invalidate the older one
-        if memory_records is not None:
-            memory_records.append_audit_log(memory_records.AuditEntry(
-                timestamp=time.strftime(ISO_TIMESTAMP_FMT, time.gmtime()),
-                action="invalidate",
-                memory_id=older.id,
-                before_state={"state": older.state, "fact_type": older.fact_type},
-                after_state={"state": "invalidated"},
-                reason=f"superseded (deterministic recency): {reason}",
-            ))
-        if invalidate_memory(older.id, reason=f"superseded: {reason}"):
-            return 1, 0
-        return 0, 0
-
-    # Missing/equal timestamps — can't determine recency, flag for human
-    pair_contents = [rec_a.content, rec_b.content]
-    fp = flag_fingerprint(pair_contents)
-    if fp in prev_flags:
-        return 0, 0
-    new_flags.add(fp)
-    problems.append(
-        f"LLM contradiction scan: state-change conflict but timestamps "
-        f"missing/equal — needs manual recency check — "
-        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
-    )
-    return 0, 1
-
-
-def _handle_stable_conflict_records(records, pair, reason, prev_flags, new_flags, problems):
-    """Handle a stable_conflict pair using structured records. Returns (invalidated, flagged)."""
-    pair_contents = [records[pair[0]].content, records[pair[1]].content]
-    a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
-    if a == b or a.startswith(b) or b.startswith(a):
-        shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
-        if invalidate_memory(records[shorter_idx].id, reason="semantic_duplicate (near-verbatim pair)"):
-            return 1, 0
-        return 0, 0
-    if re.search(r"duplicat|identical", reason, re.IGNORECASE):
-        shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
-        if invalidate_memory(records[shorter_idx].id, reason=f"semantic_duplicate (judge reason: {reason[:80]})"):
-            return 1, 0
-        return 0, 0
-    fp = flag_fingerprint(pair_contents)
-    if fp in prev_flags:
-        return 0, 0
-    new_flags.add(fp)
-    problems.append(
-        f"LLM contradiction scan: stable-attribute conflict needs review — "
-        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
-    )
-    return 0, 1
-
-
-def _handle_invalidate_meta_records(records, pair):
-    """Handle an invalidate_meta pair using structured records. Returns invalidated count."""
-    invalidated = 0
-    for idx in pair:
-        if 0 <= idx < len(records) and META_MEMORY_RE.search(records[idx].content):
-            if invalidate_memory(records[idx].id, reason=META_NOISE_REASON):
-                invalidated += 1
-    return invalidated
-
-
-def _contradiction_scan_with_records(problems):
-    """Run contradiction scan using structured records (v2.3 path)."""
-    records, total_source, _ = memory_records.get_scan_batch()
-    if len(records) < 2:
-        return
-
-    candidates = memory_records.generate_candidate_pairs(records)
-    if not candidates:
-        return
-
-    safe_records = memory_records.prepare_for_judging(records)
-    contents = [r["content"] for r in safe_records]
-    contradictions = llm_judge.detect_contradictions(contents)
-
-    invalidated = 0
-    flagged = 0
-    seen_pairs = set()
-    prev_flags = load_flag_state()
-    new_flags = set()
-
-    for c in contradictions:
-        pair = c["pair"]
-        if not (0 <= pair[0] < len(records) and 0 <= pair[1] < len(records)):
-            continue
-        key = tuple(sorted(pair))
-        if key in seen_pairs:
-            continue
-        seen_pairs.add(key)
-
-        resolution = c.get("resolution", "flag_human")
-        reason = c.get("reason", "")
-
-        if resolution == "recency_wins":
-            inv, flg = _handle_recency_wins_records(records, pair, reason, prev_flags, new_flags, problems)
-            invalidated += inv
-            flagged += flg
-        elif resolution == "invalidate_meta":
-            invalidated += _handle_invalidate_meta_records(records, pair)
-        else:
-            inv, flg = _handle_stable_conflict_records(records, pair, reason, prev_flags, new_flags, problems)
-            invalidated += inv
-            flagged += flg
-
-    if invalidated > 0:
-        problems.append(
-            f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
-            f"(recency-wins, deterministic from timestamps)"
-        )
-    if new_flags:
-        save_flag_state(prev_flags | new_flags)
-
-
-def _handle_recency_wins_recall(memories, pair, reason, newer_idx):
-    """Handle a recency_wins pair using recall-based approach. Returns invalidated count."""
-    older_idx = pair[0] if pair[1] == newer_idx else pair[1]
-    if 0 <= older_idx < len(memories):
-        mid = memories[older_idx]["id"]
-        if invalidate_memory(mid, reason=f"superseded: {reason}"):
-            return 1
-    return 0
-
-
-def _handle_invalidate_meta_recall(memories, pair):
-    """Handle an invalidate_meta pair using recall-based approach. Returns invalidated count."""
-    invalidated = 0
-    for idx in pair:
-        if 0 <= idx < len(memories) and META_MEMORY_RE.search(memories[idx]["content"]) and invalidate_memory(
-            memories[idx]["id"], reason=META_NOISE_REASON
-        ):
-            invalidated += 1
-    return invalidated
-
-
-def _handle_stable_conflict_recall(memories, pair, reason, contents, prev_flags, new_flags, problems):
-    """Handle a stable_conflict pair using recall-based approach. Returns (invalidated, flagged)."""
-    pair_contents = [contents[pair[0]], contents[pair[1]]]
-    a, b = _normalize_text(pair_contents[0]), _normalize_text(pair_contents[1])
-    if a == b or a.startswith(b) or b.startswith(a):
-        shorter_idx = pair[0] if len(a) <= len(b) else pair[1]
-        if invalidate_memory(memories[shorter_idx]["id"], reason="semantic_duplicate (near-verbatim pair)"):
-            return 1, 0
-        return 0, 0
-    if re.search(r"duplicat|identical", reason, re.IGNORECASE):
-        shorter_idx = pair[0] if len(pair_contents[0]) <= len(pair_contents[1]) else pair[1]
-        if invalidate_memory(memories[shorter_idx]["id"], reason=f"semantic_duplicate (judge reason: {reason[:80]})"):
-            return 1, 0
-        return 0, 0
-    fp = flag_fingerprint(pair_contents)
-    if fp in prev_flags:
-        return 0, 0
-    new_flags.add(fp)
-    problems.append(
-        f"LLM contradiction scan: stable-attribute conflict needs review — "
-        f"[{pair_contents[0][:60]}] vs [{pair_contents[1][:60]}] ({reason})"
-    )
-    return 0, 1
-
-
-def _contradiction_scan_with_recall(problems, memories):
-    """Run contradiction scan using recall-based approach (v2.0 fallback path)."""
-    if memories is None:
-        memories = recall_all_recent()
-    if len(memories) < 2:
-        return  # nothing to scan
-
-    contents = [m["content"] for m in memories]
-    contradictions = llm_judge.detect_contradictions(contents)
-
-    invalidated = 0
-    flagged = 0
-    seen_pairs = set()
-    prev_flags = load_flag_state()
-    new_flags = set()
-
-    for c in contradictions:
-        pair = c["pair"]
-        # v2.2.1: indices already validated by llm_judge, but double-check bounds
-        if not (0 <= pair[0] < len(memories) and 0 <= pair[1] < len(memories)):
-            continue
-        key = tuple(sorted(pair))
-        if key in seen_pairs:
-            continue
-        seen_pairs.add(key)
-
-        resolution = c.get("resolution", "flag_human")
-        reason = c.get("reason", "")
-        newer_idx = c.get("newer_index")
-
-        if resolution == "recency_wins" and newer_idx is not None:
-            invalidated += _handle_recency_wins_recall(memories, pair, reason, newer_idx)
-        elif resolution == "invalidate_meta":
-            invalidated += _handle_invalidate_meta_recall(memories, pair)
-        else:
-            inv, flg = _handle_stable_conflict_recall(memories, pair, reason, contents, prev_flags, new_flags, problems)
-            invalidated += inv
-            flagged += flg
-
-    if invalidated > 0:
-        problems.append(
-            f"LLM contradiction scan: {invalidated} stale state-change memories invalidated "
-            f"(recency-wins, non-destructive)"
-        )
-    if new_flags:
-        save_flag_state(prev_flags | new_flags)
-
-
-def llm_contradiction_scan(problems, memories=None):
-    """LLM-driven contradiction detection (Step 6, new in v2.0).
-
-    v2.3: Recency is resolved deterministically from MemoryRecord timestamps,
-    not from the LLM's interpretation of list position or wording. Uses
-    structured records when available. Cross-chunk candidate generation.
-
-    v2.0.1: handles the 'meta_noise' type (invalidate the report memory),
-    dedups flagged pairs across runs via a fingerprint state file (an
-    unresolved flag reports once, not every day), and shares the recall set
-    with the dedup pass.
-
-    Research basis:
-    - Hindsight blog: conflict handling — recency wins for state, source/confidence for stable
-    - Hindsight blog: entity drift (Postgres->MySQL) is the canonical failure
-    """
-    if llm_judge is None:
-        return  # LLM unavailable — skip
-
-    # v2.3: use structured records for deterministic recency
-    if memory_records is not None:
-        _contradiction_scan_with_records(problems)
-        return
-
-    # Fallback: old recall-based approach (v2.0)
-    _contradiction_scan_with_recall(problems, memories)
 
 
 def _restore_memory(memory_id: str):
@@ -944,7 +703,6 @@ def _restore_memory(memory_id: str):
     Re-validates a memory by PATCHing state back to 'valid'.
     Reads the audit log to find the before_state for verification.
     """
-    # Check audit log for the memory
     audit_entries = []
     if memory_records is not None:
         audit_entries = memory_records.read_audit_log(limit=10, action="invalidate")
@@ -954,7 +712,6 @@ def _restore_memory(memory_id: str):
             print(f"Found audit entry: {entry.get('timestamp')} — {entry.get('reason')}")
             print(f"  Before state: {entry.get('before_state')}")
 
-    # Re-validate the memory
     try:
         http("PATCH", f"/v1/default/banks/{BANK}/memories/{memory_id}", timeout=120,
              body={"state": "valid", "reason": "restored from audit log"})
@@ -986,23 +743,31 @@ def _print_audit_log():
               f"{e.get('memory_id', '')[:12]}... | {e.get('reason', '')[:60]}")
 
 
-def _trigger_consolidation(args, problems):
+def _trigger_consolidation(args, issues):
     """Step 1: Trigger consolidation, return operation_id or None."""
-    if args.dry_run:
-        problems.append("[dry-run] Consolidation skipped")
+    if _is_dry_run(args):
+        issues.append(Issue(code="L2_CONSOLIDATION_PENDING", severity="info",
+                             message="[dry-run] Consolidation skipped"))
         return None
     try:
         status, resp = http("POST", f"/v1/default/banks/{BANK}/consolidate", timeout=120, body={})
         op_id = resp.get("operation_id")
         if not op_id:
-            problems.append(f"Consolidate returned HTTP {status} but no operation_id: {str(resp)[:120]}")
+            issues.append(Issue(
+                code="L2_CONSOLIDATION_NO_OP_ID", severity="warning",
+                message=f"Consolidate returned HTTP {status} but no operation_id",
+                context={"response": str(resp)[:120]},
+            ))
         return op_id
     except Exception as e:
-        problems.append(f"Consolidate trigger failed: {type(e).__name__}: {e}")
+        issues.append(Issue(
+            code="L2_CONSOLIDATION_TRIGGER_FAILED", severity="warning",
+            message=f"Consolidate trigger failed: {type(e).__name__}",
+        ))
         return None
 
 
-def _poll_consolidation(op_id, problems):
+def _poll_consolidation(op_id, issues):
     """Step 2: Poll consolidation operation until terminal state or timeout."""
     deadline = time.time() + POLL_DEADLINE
     while time.time() < deadline:
@@ -1012,44 +777,57 @@ def _poll_consolidation(op_id, problems):
             if st in ("completed", "failed", "error", "cancelled"):
                 return op
         except Exception as e:
-            problems.append(f"Operation poll failed: {type(e).__name__}: {e}")
+            issues.append(Issue(
+                code="L2_OPERATION_POLL_FAILED", severity="warning",
+                message=f"Operation poll failed: {type(e).__name__}",
+            ))
             return None
         time.sleep(POLL_INTERVAL)
     return None
 
 
-def _run_consolidation(args, problems):
+def _run_consolidation(args, issues):
     """Steps 1-2: Trigger consolidation and poll for completion."""
-    op_id = _trigger_consolidation(args, problems)
+    op_id = _trigger_consolidation(args, issues)
     if not op_id:
         return None
 
-    final = _poll_consolidation(op_id, problems)
+    final = _poll_consolidation(op_id, issues)
     if final is None:
-        problems.append(f"Consolidation op {op_id[:8]} did not finish within {POLL_DEADLINE}s")
+        issues.append(Issue(
+            code="L2_CONSOLIDATION_TIMEOUT", severity="warning",
+            message=f"Consolidation op {op_id[:8]} did not finish within {POLL_DEADLINE}s",
+        ))
     elif final.get("status") != "completed":
-        problems.append(f"Consolidation op {op_id[:8]} ended with status={final.get('status')}")
+        issues.append(Issue(
+            code="L2_CONSOLIDATION_BAD_STATUS", severity="warning",
+            message=f"Consolidation op {op_id[:8]} ended with status={final.get('status')}",
+        ))
     return final
 
 
-def _run_smoke_tests(args, problems, final):
-    """Steps 3 + 3b: Recall and retain smoke-tests."""
-    # --- 3. Recall smoke-test (consolidation over-prune check) ----------
+def _run_smoke_tests(args, issues, final):
+    """Steps 2b + 2c: Recall and retain smoke-tests."""
+    # --- Recall smoke-test (consolidation over-prune check) ----------
     if final is not None and final.get("status") == "completed":
         try:
             _, rec = http("POST", f"/v1/default/banks/{BANK}/memories/recall", timeout=120,
                           body={"query": "David's preferred output language and document summary style"})
             hits = rec.get("results") or rec.get("memories") or rec.get("items") or []
             if not hits:
-                problems.append(
-                    "Recall smoke-test returned 0 results after consolidation — "
-                    "possible over-prune; verify manually"
-                )
+                issues.append(Issue(
+                    code="L2_RECALL_SMOKE_TEST_EMPTY", severity="warning",
+                    message="Recall smoke-test returned 0 results after consolidation — "
+                            "possible over-prune; verify manually",
+                ))
         except Exception as e:
-            problems.append(f"Recall smoke-test failed: {type(e).__name__}: {e}")
+            issues.append(Issue(
+                code="L2_RECALL_SMOKE_TEST_FAILED", severity="warning",
+                message=f"Recall smoke-test failed: {type(e).__name__}",
+            ))
 
-    # --- 3b. Retain smoke-test (silent write-failure check) -------------
-    if not args.dry_run:
+    # --- Retain smoke-test (silent write-failure check) -------------
+    if not _is_dry_run(args):
         try:
             _, ret = http("POST", f"/v1/default/banks/{BANK}/memories", timeout=120,
                           body={"items": [{
@@ -1058,56 +836,89 @@ def _run_smoke_tests(args, problems, final):
                           }]})
             usage = (ret.get("usage") or {})
             if not ret.get("success"):
-                problems.append(f"Retain smoke-test failed: success != true ({str(ret)[:120]})")
+                issues.append(Issue(
+                    code="L2_RETAIN_SMOKE_TEST_FAILED", severity="critical",
+                    message=f"Retain smoke-test failed: success != true ({str(ret)[:120]})",
+                ))
             elif not usage.get("total_tokens"):
-                problems.append(
-                    "Retain smoke-test: success but total_tokens=0 — "
-                    "fact extraction not running; check LLM provider/auth"
-                )
+                issues.append(Issue(
+                    code="L2_RETAIN_SMOKE_TEST_NO_TOKENS", severity="critical",
+                    message="Retain smoke-test: success but total_tokens=0 — "
+                            "fact extraction not running; check LLM provider/auth",
+                ))
         except Exception as e:
-            problems.append(f"Retain smoke-test failed: {type(e).__name__}: {e}")
+            issues.append(Issue(
+                code="L2_RETAIN_SMOKE_TEST_FAILED", severity="critical",
+                message=f"Retain smoke-test failed: {type(e).__name__}",
+            ))
 
 
-def _check_bank_stats(problems):
-    """Step 4: Bank stats + failed_operations trend."""
+def _check_bank_stats(issues):
+    """Step 3: Bank stats + failed_operations trend."""
     try:
         _, stats = http("GET", f"/v1/default/banks/{BANK}/stats", timeout=120)
         nodes = stats.get("total_nodes", 0)
         docs = stats.get("total_documents", 0)
         if nodes <= 0:
-            problems.append(f"Bank '{BANK}' stats suspicious: total_nodes={nodes}, docs={docs}")
+            issues.append(Issue(
+                code="L2_BANK_STATS_SUSPICIOUS", severity="warning",
+                message=f"Bank '{BANK}' stats suspicious",
+                context={"total_nodes": nodes, "total_documents": docs},
+            ))
         failed = stats.get("failed_operations", 0)
         prev_failed = 0
         if STATE_FILE.exists():
             with contextlib.suppress(Exception):
                 prev_failed = int(json.loads(STATE_FILE.read_text()).get("failed_operations", 0))
         if failed >= FAILED_OPS_WARN or failed > prev_failed:
-            problems.append(
-                f"failed_operations={failed} (was {prev_failed}) — "
-                f"Hindsight writes failing silently; check backlog"
-            )
+            issues.append(Issue(
+                code="L2_FAILED_OPERATIONS_INCREASED", severity="warning",
+                message="Hindsight failed operations increased — writes failing silently; check backlog",
+                context={"current": failed, "previous": prev_failed},
+            ))
         _atomic_write_text(STATE_FILE, json.dumps({"failed_operations": failed}))
     except Exception as e:
-        problems.append(f"Bank stats fetch failed: {type(e).__name__}: {e}")
+        issues.append(Issue(
+            code="L2_BANK_STATS_FETCH_FAILED", severity="warning",
+            message=f"Bank stats fetch failed: {type(e).__name__}",
+        ))
 
 
-def _run_llm_passes(args, problems):
-    """Step 5: LLM dedup + contradiction passes."""
-    if not args.dry_run:
-        try:
-            cleanup_smoke_tests(problems)
-            memories = recall_all_recent()
-            if memories:
-                invalidate_meta_memories(memories, problems)
-                exact_dupes = exact_duplicate_prepass(memories)
-                if exact_dupes:
-                    problems.append(f"Exact-duplicate pre-pass: {exact_dupes} verbatim copies invalidated")
-                # Drop memories invalidated by the pre-passes before the LLM sees them
-                memories = [m for m in memories if not META_MEMORY_RE.search(m["content"])]
-            llm_semantic_dedup_pass(problems, memories=memories)
-            llm_contradiction_scan(problems, memories=memories)
-        except Exception as e:
-            problems.append(f"LLM dedup/contradiction passes failed: {type(e).__name__}: {e}")
+def _run_heuristic_passes(args, issues):
+    """Steps 5-10: self-pollution cleanup + heuristic dedup + contradiction scan.
+
+    Processing order (v3.0 spec section 10):
+      5. Remove expired smoke-test records
+      6. Remove known meta-maintenance records
+      7. Run exact and strong heuristic dedup
+      8. Re-fetch or filter invalidated records
+      9. Run structured contradiction detection
+     10. Apply only high-confidence recency_wins; report the rest
+    """
+    dry = _is_dry_run(args)
+    try:
+        # 5. Expired smoke-test records
+        if not dry:
+            cleanup_smoke_tests(issues)
+
+        # 6. Meta-maintenance records + shared recall set
+        memories = recall_all_recent()
+        if memories:
+            if not dry:
+                invalidate_meta_memories(memories, issues)
+            # 8. Filter invalidated records before the scans
+            memories = [m for m in memories if not META_MEMORY_RE.search(m["content"])]
+
+        # 7. Exact + strong heuristic dedup
+        heuristic_dedup_pass(issues, memories=memories)
+
+        # 9-10. Structured contradiction detection
+        heuristic_contradiction_scan(issues, memories=memories)
+    except Exception as e:
+        issues.append(Issue(
+            code="HEURISTIC_PASS_FAILED", severity="warning",
+            message=f"Heuristic dedup/contradiction passes failed: {type(e).__name__}: {e}",
+        ))
 
 
 def _get_hindsight_version():
@@ -1142,14 +953,8 @@ def _detect_stale_pages(pages, version_parts, api_version):
     return stale, use_tree_stale_directly
 
 
-def _check_knowledge_pages(problems):
-    """Step 7: Knowledge Pages health (Hindsight >= 0.9 only)."""
-    # v2.3: Version-gate the is_stale behavior. Per current Hindsight docs
-    # (v0.9.1+), tree is_stale is scope-aware (only marks stale when a
-    # memory in that page's tags+fact-type scope has been written since
-    # the page last read memories). The old bank-wide approximation
-    # workaround (querying mental models for small KBs) is only needed
-    # for versions < 0.9.1.
+def _check_knowledge_pages(issues):
+    """Step 11: Knowledge Pages health (Hindsight >= 0.9 only)."""
     try:
         api_version, version_parts = _get_hindsight_version()
 
@@ -1160,21 +965,24 @@ def _check_knowledge_pages(problems):
 
         stale, use_tree_stale_directly = _detect_stale_pages(pages, version_parts, api_version)
         if stale and len(stale) / len(pages) > KP_STALE_RATIO_WARN:
-            problems.append(
-                f"Knowledge Pages: {len(stale)}/{len(pages)} pages stale "
-                f"(v{api_version}, {'scope-aware' if use_tree_stale_directly else 'approximate'} signal) "
-                f"(e.g. {', '.join(n['name'] for n in stale[:3])}) — pages falling behind consolidation"
-            )
+            issues.append(Issue(
+                code="KP_PAGES_STALE", severity="warning",
+                message=f"Knowledge Pages: {len(stale)}/{len(pages)} pages stale "
+                        f"(v{api_version}, {'scope-aware' if use_tree_stale_directly else 'approximate'} signal) "
+                        f"(e.g. {', '.join(n['name'] for n in stale[:3])}) — pages falling behind consolidation",
+            ))
     except urllib.error.HTTPError:
         pass  # <0.9 or KB disabled — not an error
     except Exception as e:
-        problems.append(f"Knowledge Pages check failed: {type(e).__name__}: {e}")
+        issues.append(Issue(
+            code="KP_CHECK_FAILED", severity="warning",
+            message=f"Knowledge Pages check failed: {type(e).__name__}",
+        ))
 
 
-def _check_l3_wiki(problems):
-    """Step 7b: L3 wiki lint-lite."""
+def _check_l3_wiki(issues):
+    """Step 12: L3 wiki lint-lite."""
     try:
-        # Check both KB_DIR (~/.hermes/kb) and WIKI_DIR (~/wiki or $WIKI_DIR)
         for wiki_dir in (KB_DIR, WIKI_DIR):
             if wiki_dir.exists():
                 md_files = [p for p in wiki_dir.rglob("*.md") if "_archive" not in p.parts]
@@ -1184,63 +992,86 @@ def _check_l3_wiki(problems):
                     if p.stat().st_mtime < cutoff and "index.md" not in p.name.lower():
                         stale.append(p.name)
                 if len(stale) >= 5:
-                    problems.append(
-                        f"L3 wiki ({wiki_dir}): {len(stale)} of {len(md_files)} pages older than {KB_STALE_DAYS} days "
-                        f"(e.g. {', '.join(sorted(stale)[:3])}) — run llm-wiki lint / refresh"
-                    )
+                    issues.append(Issue(
+                        code="L3_WIKI_STALE", severity="warning",
+                        message=f"L3 wiki ({wiki_dir}): {len(stale)} of {len(md_files)} pages "
+                                f"older than {KB_STALE_DAYS} days "
+                                f"(e.g. {', '.join(sorted(stale)[:3])}) — run llm-wiki lint / refresh",
+                    ))
     except Exception as e:
-        problems.append(f"L3 wiki check failed: {type(e).__name__}: {e}")
+        issues.append(Issue(
+            code="L3_WIKI_CHECK_FAILED", severity="warning",
+            message=f"L3 wiki check failed: {type(e).__name__}",
+        ))
 
 
-def _check_local_memory(args, problems):
-    """Step 8: Local memory capacity check."""
-    # v2.2.1: use decoded char count, not st_size bytes
+def _check_local_memory(args, issues):
+    """Step 13: Local memory capacity check."""
     try:
         if MEM_FILE.exists():
             content = MEM_FILE.read_text(encoding="utf-8")
             n = len(content)
             pct = n / MEM_CAP
             if pct >= OFFLOAD_AT:
-                _handle_memory_offload(args, problems, n, pct)
+                _handle_memory_offload(args, issues, n, pct)
             elif pct >= MEM_WARN:
-                problems.append(f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — approaching capacity")
+                issues.append(Issue(
+                    code="L1_MEMORY_NEAR_CAPACITY", severity="warning",
+                    message=f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — approaching capacity",
+                ))
         if USER_FILE.exists():
             content = USER_FILE.read_text(encoding="utf-8")
             n = len(content)
             pct = n / USER_CAP
             if pct >= MEM_WARN:
-                problems.append(f"USER.md at {n}/{USER_CAP} chars ({int(pct*100)}%) — prune or offload to Hindsight")
+                issues.append(Issue(
+                    code="L1_USER_NEAR_CAPACITY", severity="warning",
+                    message=f"USER.md at {n}/{USER_CAP} chars ({int(pct*100)}%) — prune or offload to Hindsight",
+                ))
     except Exception as e:
-        problems.append(f"Local memory check failed: {type(e).__name__}: {e}")
+        issues.append(Issue(
+            code="L1_CHECK_FAILED", severity="warning",
+            message=f"Local memory check failed: {type(e).__name__}",
+        ))
 
 
-def _handle_memory_offload(args, problems, n, pct):
+def _handle_memory_offload(args, issues, n, pct):
     """Handle memory offload when MEMORY.md is over capacity."""
     if memory_offload is None:
-        problems.append(
-            f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-            "memory_offload.py not found next to this script; offload skipped"
-        )
-    elif not args.dry_run:
+        issues.append(Issue(
+            code="L1_CAPACITY_EXCEEDED", severity="warning",
+            message=f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                    "memory_offload.py not found next to this script; offload skipped",
+        ))
+    elif not _is_dry_run(args):
         try:
             used_before, _ = memory_offload.get_memory_usage()
             memory_offload.main()
             used_after, _ = memory_offload.get_memory_usage()
             if used_after < used_before:
-                problems.append(
-                    f"MEMORY.md was at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                    f"offloaded to Hindsight, now {used_after}/{MEM_CAP} chars"
-                )
+                issues.append(Issue(
+                    code="L1_OFFLOAD_DONE", severity="info",
+                    message=f"MEMORY.md was at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                            f"offloaded to Hindsight, now {used_after}/{MEM_CAP} chars",
+                ))
             else:
-                problems.append(
-                    f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                    f"offload ran but no entries moved (all essential?). Prune manually."
-                )
+                issues.append(Issue(
+                    code="L1_OFFLOAD_NO_PROGRESS", severity="warning",
+                    message=f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                            "offload ran but no entries moved (all essential?). Prune manually.",
+                ))
         except Exception as e:
-            problems.append(
-                f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
-                f"offload failed: {type(e).__name__}: {e}"
-            )
+            issues.append(Issue(
+                code="L1_OFFLOAD_FAILED", severity="warning",
+                message=f"MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                        f"offload failed: {type(e).__name__}",
+            ))
+    else:
+        issues.append(Issue(
+            code="L1_CAPACITY_EXCEEDED", severity="info",
+            message=f"[dry-run] MEMORY.md at {n}/{MEM_CAP} chars ({int(pct*100)}%) — "
+                    "offload would run here",
+        ))
 
 
 def _build_telegram_text(unresolved, resolved):
@@ -1250,42 +1081,42 @@ def _build_telegram_text(unresolved, resolved):
         f"<b>🧠 Daily Memory Optimization</b>\n"
         f"<i>{timestamp}</i>\n\n"
         f"<b>{len(unresolved)} issue(s) need your attention "
-        f"(LLM auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
+        f"(rule-based auto-resolve attempted, {len(resolved)} resolved):</b>\n\n"
     )
     for u in unresolved:
-        tg_text += f"  • {_escape_html(u)}\n"
+        tg_text += f"  • {_escape_html(render_issue(u) if isinstance(u, Issue) else str(u))}\n"
     return tg_text
 
 
 def _get_run_mode(args):
     """Determine the current run mode string for output."""
-    if args.dry_run:
+    if _is_dry_run(args):
         return "dry-run"
-    if args.apply:
+    if getattr(args, "apply", False):
         return "apply"
     if ALLOW_DESTRUCTIVE:
         return "destructive"
     return "safe"
 
 
-def _output_results(args, problems):
-    """Step 9: Output: LLM auto-resolve → Telegram fallback."""
-    if not problems:
+def _output_results(args, issues):
+    """Step 15: Output: rule-based auto-resolve → Telegram fallback."""
+    if not issues:
         return  # empty stdout -> cron stays silent
 
-    # Step 9a: attempt LLM auto-resolution
-    resolved, unresolved = try_resolve_issues_with_llm(problems)
+    # Step 14: attempt deterministic rule-based resolution
+    resolved, unresolved = try_resolve_issues_with_rules(issues)
 
-    # Step 9b: build output report
+    # Build output report
     if resolved:
-        print("**🧠 Daily Memory Optimization — issues auto-resolved**\n")
+        print("**🧠 Daily Memory Optimization — issues auto-resolved (rule-based)**\n")
         for r in resolved:
             print(f"  ✅ {r}")
 
     if not unresolved:
         return
 
-    # Step 9c: notify user via Telegram DM for remaining issues
+    # Notify user via Telegram DM for remaining issues
     tg_text = _build_telegram_text(unresolved, resolved)
     tg_sent = send_telegram_notification(tg_text)
     delivery_status = (
@@ -1297,20 +1128,23 @@ def _output_results(args, problems):
     mode = _get_run_mode(args)
     print(f"\n**🧠 Daily Memory Optimization — unresolved issues ({delivery_status}, mode={mode})**\n")
     for u in unresolved:
-        print(f"  ⚠️ {u}")
+        print(f"  ⚠️ {render_issue(u) if isinstance(u, Issue) else str(u)}")
+
+
+# Module-level args reference for helper functions (set in main()).
+_current_args = argparse.Namespace(dry_run=False)
 
 
 def main():
-    global ALLOW_DESTRUCTIVE
+    global ALLOW_DESTRUCTIVE, _current_args
 
-    # v2.2.1: parse CLI args
-    # v2.4: added --apply and --restore modes
-    parser = argparse.ArgumentParser(description="Daily memory optimization")
+    parser = argparse.ArgumentParser(description="Daily memory optimization (v3.0 rule-based)")
     parser.add_argument("--allow-destructive", action="store_true",
-                        help="Enable LLM auto-mutation (invalidate, config_tune). "
-                             "Default: disabled — LLM is advisor only.")
+                        help="Enable auto-mutation (invalidate, config_tune). "
+                             "Default: disabled — rules are advisor only.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Report issues without taking any action.")
+                        help="Report issues without taking any action. "
+                             "Also active via MEMORY_HEURISTICS_DRY_RUN=1.")
     parser.add_argument("--apply", action="store_true",
                         help="Apply all recommended actions (implies --allow-destructive). "
                              "Use --dry-run first to preview.")
@@ -1320,6 +1154,8 @@ def main():
     parser.add_argument("--audit-log", action="store_true",
                         help="Print recent audit log entries and exit.")
     args = parser.parse_args()
+
+    _current_args = args
 
     # --apply implies --allow-destructive
     if args.apply:
@@ -1337,31 +1173,31 @@ def main():
         _print_audit_log()
         return
 
-    problems = []
+    issues = []
 
     # --- 1-2. Trigger consolidation + poll -------------------------------
-    final = _run_consolidation(args, problems)
+    final = _run_consolidation(args, issues)
 
-    # --- 3 + 3b. Smoke tests ---------------------------------------------
-    _run_smoke_tests(args, problems, final)
+    # --- 2b + 2c. Smoke tests --------------------------------------------
+    _run_smoke_tests(args, issues, final)
 
-    # --- 4. Bank stats + failed_operations trend -------------------------
-    _check_bank_stats(problems)
+    # --- 3. Bank stats + failed_operations trend --------------------------
+    _check_bank_stats(issues)
 
-    # --- 5. LLM dedup + contradiction passes (v2.0, restructured v2.0.1) -
-    _run_llm_passes(args, problems)
+    # --- 5-10. Self-pollution cleanup + heuristic passes ------------------
+    _run_heuristic_passes(args, issues)
 
-    # --- 7. Knowledge Pages health (Hindsight >= 0.9 only) ---------------
-    _check_knowledge_pages(problems)
+    # --- 11. Knowledge Pages health (Hindsight >= 0.9 only) ---------------
+    _check_knowledge_pages(issues)
 
-    # --- 7b. L3 wiki lint-lite ------------------------------------------
-    _check_l3_wiki(problems)
+    # --- 12. L3 wiki lint-lite -------------------------------------------
+    _check_l3_wiki(issues)
 
-    # --- 8. Local memory capacity check --------------------------------
-    _check_local_memory(args, problems)
+    # --- 13. Local memory capacity check ---------------------------------
+    _check_local_memory(args, issues)
 
-    # --- 9. Output: LLM auto-resolve → Telegram fallback -----------------
-    _output_results(args, problems)
+    # --- 14-15. Output: rule-based auto-resolve → Telegram fallback -------
+    _output_results(args, issues)
 
 
 if __name__ == "__main__":
