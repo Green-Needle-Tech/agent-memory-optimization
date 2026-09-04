@@ -178,6 +178,13 @@ def get_scan_batch(max_records: int = MAX_SCAN_PER_RUN) -> tuple[list[MemoryReco
     every valid world/experience memory is eventually examined across
     multiple daily runs, rather than only scanning the top-N from one
     broad recall query.
+
+    Side effect: persists the advanced cursor via save_scan_cursor()
+    ONLY after the batch is successfully fetched. Callers that consume
+    the batch (dedup/contradiction passes) should call save_scan_cursor(
+    {"offset": new_offset, "total_seen": <prev total_seen + len(records)>})
+    after processing so a crashed run re-examines the same slice rather
+    than skipping it.
     """
     cursor = load_scan_cursor()
     offset = cursor.get("offset", 0)
@@ -212,6 +219,19 @@ def get_scan_batch(max_records: int = MAX_SCAN_PER_RUN) -> tuple[list[MemoryReco
         new_offset = 0  # wrap around — start fresh next run
 
     return records, total_source, new_offset
+
+
+def commit_scan_cursor(new_offset: int, scanned: int) -> None:
+    """Persist the scan cursor after a batch has been processed.
+
+    get_scan_batch() no longer advances the cursor itself — a run that
+    crashes mid-processing would otherwise skip the slice. Call this
+    once dedup/contradiction passes have consumed the batch.
+    """
+    save_scan_cursor({
+        "offset": new_offset,
+        "total_seen": load_scan_cursor().get("total_seen", 0) + scanned,
+    })
 
 
 # === Cross-chunk candidate generation ===

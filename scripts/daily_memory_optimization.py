@@ -249,7 +249,9 @@ def curate_memory(memory_id, action="invalidate", reason=""):
     if mem is None:
         return False
 
-    fact_type = mem.get("fact_type", "world")
+    # GET /memories/{id} returns the fact type under "type" (observations);
+    # /memories/list returns it under "fact_type". Accept both.
+    fact_type = mem.get("fact_type") or mem.get("type") or "world"
 
     if fact_type in ("world", "experience"):
         # Source fact — safe to invalidate directly
@@ -592,8 +594,32 @@ def recall_recent_memories(query="user preferences, environment, configuration, 
         return []
 
 
+_pending_scan_cursor_offset = None  # set by recall_all_recent when the scan batch is used
+
+
 def recall_all_recent(limit=DEDUP_RECALL_LIMIT):
-    """Recall a broad mix of recent memories (single shared set for dedup + contradictions)."""
+    """Recall a broad mix of recent memories (single shared set for dedup + contradictions).
+
+    When memory_records is importable, use the paginated /memories/list
+    scan batch instead of semantic recall: recall only surfaces what a
+    query retrieves, so duplicates outside the query's neighborhood are
+    never examined — and the same duplicate pair re-appears in every run.
+    The scan cursor walks every valid world/experience memory eventually.
+    """
+    global _pending_scan_cursor_offset
+    _pending_scan_cursor_offset = None
+    if memory_records is not None:
+        try:
+            records, _total, new_offset = memory_records.get_scan_batch(limit or DEDUP_RECALL_LIMIT)
+            if records:
+                _pending_scan_cursor_offset = new_offset
+                return [
+                    {"id": r.id, "content": r.content,
+                     "created_at": r.date, "updated_at": r.edited_at, "tags": r.tags}
+                    for r in records
+                ]
+        except Exception as e:
+            print(f"warn: scan batch fetch failed ({e}); falling back to recall", file=sys.stderr)
     return recall_recent_memories(
         query="user preferences, environment, configuration, tools, versions, migrations, decisions",
         limit=limit,
@@ -1063,6 +1089,7 @@ def _run_heuristic_passes(args, issues):
 
         # 6. Meta-maintenance records + shared recall set
         memories = recall_all_recent()
+        scan_cursor_new_offset = _pending_scan_cursor_offset
         if memories:
             if not dry:
                 invalidate_meta_memories(memories, issues)
@@ -1074,6 +1101,11 @@ def _run_heuristic_passes(args, issues):
 
         # 9-10. Structured contradiction detection
         heuristic_contradiction_scan(issues, memories=memories)
+
+        # Commit the scan cursor only after the batch was fully processed
+        # (crash safety: a failed run re-examines the same slice).
+        if not dry and scan_cursor_new_offset is not None and memory_records is not None:
+            memory_records.commit_scan_cursor(scan_cursor_new_offset, len(memories))
     except Exception as e:
         issues.append(Issue(
             code="HEURISTIC_PASS_FAILED", severity="warning",

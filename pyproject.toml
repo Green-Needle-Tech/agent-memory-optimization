@@ -64,7 +64,7 @@ ignore = [
 max-complexity = 60  # operational scripts are inherently branch-heavy
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]  # assert is fine in tests
+"tests/*" = ["S101", "S108"]  # assert + /tmp fixture paths are fine in tests
 
 [tool.mypy]
 python_version = "3.10"

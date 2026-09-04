@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.3.0
+version: 3.5.0
 author: Iris
 license: MIT
 trigger: >-
@@ -17,6 +17,15 @@ metadata:
 ---
 
 # Three-Layer Memory Optimization (L1 / L2 / L3)
+
+## v3.5 — Full-Coverage Dedup Scan + Observation-Curation Fix (Sep 2026)
+
+Two correctness fixes found during the Sep 2026 full evaluation:
+
+1. **Dedup/contradiction scans now use the paginated scan batch** (`recall_all_recent` → `memory_records.get_scan_batch`), not semantic recall. Recall only surfaces what one query retrieves, so (a) duplicates outside the query neighborhood were never examined, and (b) the same duplicate pair re-appeared in every daily run — the audit log showed the same observation invalidated 3 days in a row. The scan cursor walks every valid world/experience memory across runs (crash-safe: cursor commits only after the batch is processed via `commit_scan_cursor`).
+2. **Observation fact-type detection fixed** (`curate_memory`). `GET /memories/{id}` returns the fact type under `type` (observations), while `/memories/list` returns it under `fact_type` — the old code defaulted missing `fact_type` to `world`, so observations hit the direct-PATCH path and returned 400 (silently swallowed as `False`). Now both keys are accepted; observations correctly fall through to source invalidation.
+
+Also: `pyproject.toml` ruff per-file-ignores now include `S108` for test fixture paths.
 
 ## Location-Aware Resolution (v3.3, Sep 2026)
 
@@ -138,6 +147,12 @@ The LLM resolver that could select arbitrary API actions is removed. Replaced wi
 | `EXACT_DUPLICATE` | invalidate_exact_memory_id |
 | `STRONG_DUPLICATE` | invalidate_exact_memory_id |
 | `STATE_CHANGE_HIGH_CONFIDENCE` | invalidate_exact_older_memory_id |
+| `SMOKE_TEST_CLEANUP` | mark_resolved (v3.4 — post-action info) |
+| `META_MEMORY_CLEANUP` | mark_resolved (v3.4 — post-action info) |
+| `POSSIBLE_DUPLICATE_REPORT` | mark_resolved (v3.4 — report-only) |
+| `L3_LINT_REPORT` | mark_resolved (v3.4 — lint already ran) |
+| `KP_PAGES_STALE` | trigger_consolidation (v3.4 — may refresh pages) |
+| `L1_USER_NEAR_CAPACITY` | prune_user_md (v3.4 — conservative offload) |
 
 Everything outside this allowlist remains unresolved and is sent through the notification path. Destructive actions require `--allow-destructive` or `--apply`.
 
