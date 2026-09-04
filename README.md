@@ -13,6 +13,19 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
+## v3.5 — Full-Coverage Dedup Scan + Observation-Curation Fix (Sep 2026)
+
+Two correctness fixes found during the Sep 2026 full evaluation:
+
+1. **Dedup/contradiction scans now use the paginated scan batch** (`recall_all_recent` → `memory_records.get_scan_batch`), not semantic recall. Recall only surfaces what one query retrieves, so duplicates outside the query neighborhood were never examined, and the same duplicate pair re-appeared in every daily run. The scan cursor walks every valid world/experience memory across runs (crash-safe: cursor commits only after the batch is processed via `commit_scan_cursor`).
+2. **Observation fact-type detection fixed** (`curate_memory`). `GET /memories/{id}` returns the fact type under `type` (observations), while `/memories/list` returns it under `fact_type` — the old code defaulted missing `fact_type` to `world`, so observations hit the direct-PATCH path and returned 400 (silently swallowed as `False`). Now both keys are accepted; observations correctly fall through to source invalidation.
+
+Also: `pyproject.toml` ruff per-file-ignores now include `S108` for test fixture paths.
+
+## v3.4 — Expanded Remediation Allowlist (Sep 2026)
+
+All issue codes now have rule-based auto-resolve actions. New entries: `SMOKE_TEST_CLEANUP` (mark_resolved), `META_MEMORY_CLEANUP` (mark_resolved), `POSSIBLE_DUPLICATE_REPORT` (mark_resolved, report-only), `L3_LINT_REPORT` (mark_resolved), `KP_PAGES_STALE` (trigger_consolidation), `L1_USER_NEAR_CAPACITY` (prune_user_md, conservative offload). Post-action info and report-only issues are marked resolved without destructive side effects.
+
 ## v3.3 — Location-Aware Path Resolution (Sep 2026)
 
 All script locations are now resolved from the **existing deployment**, not just the current user's home. New shared module `scripts/paths.py` (stdlib-only), used by every script:
