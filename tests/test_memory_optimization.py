@@ -349,7 +349,7 @@ class TestDailyMemoryOptimization:
         assert "current=15" in rendered
 
     def test_rule_remediations_allowlist(self):
-        """RULE_REMEDIATIONS should contain only the spec-defined allowlist."""
+        """RULE_REMEDIATIONS should contain the spec-defined allowlist (v3.4 expanded)."""
         expected_keys = {
             "L2_CONSOLIDATION_PENDING",
             "L1_CAPACITY_EXCEEDED",
@@ -358,6 +358,15 @@ class TestDailyMemoryOptimization:
             "EXACT_DUPLICATE",
             "STRONG_DUPLICATE",
             "STATE_CHANGE_HIGH_CONFIDENCE",
+            # v3.4: post-action info issues — mark_resolved
+            "SMOKE_TEST_CLEANUP",
+            "META_MEMORY_CLEANUP",
+            "POSSIBLE_DUPLICATE_REPORT",
+            "L3_LINT_REPORT",
+            # v3.4: KP staleness — trigger_consolidation
+            "KP_PAGES_STALE",
+            # v3.4: USER.md near capacity — prune_user_md
+            "L1_USER_NEAR_CAPACITY",
         }
         assert set(daily_memory_optimization.RULE_REMEDIATIONS.keys()) == expected_keys
 
@@ -495,6 +504,140 @@ class TestDestructiveFlag:
         resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
         assert len(unresolved) == 1
         assert len(resolved) == 0
+
+
+# ============================================================================
+# Daily Memory Optimization: v3.4 expanded remediation allowlist
+# ============================================================================
+
+class TestV34RemediationActions:
+    """Tests for v3.4 mark_resolved, KP consolidation, and USER.md prune."""
+
+    def test_mark_resolved_for_smoke_test_cleanup(self):
+        """SMOKE_TEST_CLEANUP should be resolved (work already done)."""
+        issue = daily_memory_optimization.Issue(
+            code="SMOKE_TEST_CLEANUP", severity="info",
+            message="Self-pollution cleanup: 1 old smoke-test memories invalidated",
+        )
+        resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(resolved) == 1
+        assert len(unresolved) == 0
+        assert "resolved" in resolved[0]
+
+    def test_mark_resolved_for_meta_memory_cleanup(self):
+        """META_MEMORY_CLEANUP should be resolved (work already done)."""
+        issue = daily_memory_optimization.Issue(
+            code="META_MEMORY_CLEANUP", severity="info",
+            message="Self-pollution cleanup: 2 meta-memories invalidated",
+        )
+        resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(resolved) == 1
+        assert len(unresolved) == 0
+
+    def test_mark_resolved_for_possible_duplicate_report(self):
+        """POSSIBLE_DUPLICATE_REPORT should be resolved (report-only, no action)."""
+        issue = daily_memory_optimization.Issue(
+            code="POSSIBLE_DUPLICATE_REPORT", severity="info",
+            message="Heuristic dedup: 3 possible (report-only) duplicate groups found",
+        )
+        resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(resolved) == 1
+        assert len(unresolved) == 0
+
+    def test_mark_resolved_for_l3_lint_report(self):
+        """L3_LINT_REPORT should be resolved (lint already ran)."""
+        issue = daily_memory_optimization.Issue(
+            code="L3_LINT_REPORT", severity="warning",
+            message="L3 lint pass: 61 of 136 active pages stale — 0 errors, 208 warnings",
+            context={"error_count": 0, "warning_count": 208, "info_count": 74, "pages_scanned": 134},
+        )
+        resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(resolved) == 1
+        assert len(unresolved) == 0
+
+    def test_kp_pages_stale_triggers_consolidation(self):
+        """KP_PAGES_STALE should trigger consolidation (non-destructive)."""
+        issue = daily_memory_optimization.Issue(
+            code="KP_PAGES_STALE", severity="warning",
+            message="Knowledge Pages: 1/1 pages stale",
+        )
+        with patch.object(daily_memory_optimization, "http", return_value=(200, {"ok": True})):
+            resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(resolved) == 1
+        assert len(unresolved) == 0
+        assert "consolidation" in resolved[0].lower()
+
+    def test_user_near_capacity_prune_without_flag(self):
+        """L1_USER_NEAR_CAPACITY prune requires --allow-destructive."""
+        issue = daily_memory_optimization.Issue(
+            code="L1_USER_NEAR_CAPACITY", severity="warning",
+            message="USER.md at 1332/1375 chars (96%)",
+            context={"file": "/tmp/USER.md", "chars": 1332, "cap": 1375},
+        )
+        with patch.object(daily_memory_optimization, "ALLOW_DESTRUCTIVE", False):
+            resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(unresolved) == 1
+        assert len(resolved) == 0
+
+    def test_user_near_capacity_prune_all_essential(self):
+        """When all USER.md entries are durable preferences, prune returns None."""
+        issue = daily_memory_optimization.Issue(
+            code="L1_USER_NEAR_CAPACITY", severity="warning",
+            message="USER.md at 1332/1375 chars (96%)",
+            context={"file": "/tmp/USER.md", "chars": 1332, "cap": 1375},
+        )
+        # Durable preference entry — doesn't match any offload pattern
+        durable_entry = "David's honesty rules: never fabricate; if no info, say 'Info not available'."
+        with patch.object(daily_memory_optimization, "ALLOW_DESTRUCTIVE", True), \
+             patch.object(daily_memory_optimization, "USER_FILE") as mock_user_file:
+            mock_user_file.exists.return_value = True
+            mock_user_file.read_text.return_value = durable_entry
+            resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(unresolved) == 1
+        assert len(resolved) == 0
+        assert "durable preferences" in unresolved[0].message
+
+    def test_user_near_capacity_prune_success(self):
+        """Successful USER.md prune offloads entries and rewrites file."""
+        issue = daily_memory_optimization.Issue(
+            code="L1_USER_NEAR_CAPACITY", severity="warning",
+            message="USER.md at 1332/1375 chars (96%)",
+            context={"file": "/tmp/USER.md", "chars": 1332, "cap": 1375},
+        )
+        # One durable preference (kept) + one offloadable (matches "completed task" pattern)
+        durable = "David's honesty rules: never fabricate."
+        offloadable = "Old completed task that was resolved on 2026-08-01"
+        with patch.object(daily_memory_optimization, "ALLOW_DESTRUCTIVE", True), \
+             patch.object(daily_memory_optimization, "USER_FILE") as mock_user_file, \
+             patch.object(daily_memory_optimization.memory_offload, "hindsight_recall_check",
+                          return_value=False), \
+             patch.object(daily_memory_optimization.memory_offload, "hindsight_retain",
+                          return_value=True), \
+             patch.object(daily_memory_optimization, "_atomic_write_text") as mock_write:
+            mock_user_file.exists.return_value = True
+            mock_user_file.read_text.return_value = f"{durable}\n§\n{offloadable}"
+            resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules([issue])
+        assert len(resolved) == 1
+        assert len(unresolved) == 0
+        assert "offloaded" in resolved[0]
+        mock_write.assert_called_once()
+
+    def test_all_v34_info_issues_silent_on_success(self):
+        """When all issues are v3.4-resolvable, output should be silent (no Telegram)."""
+        issues = [
+            daily_memory_optimization.Issue(
+                code="SMOKE_TEST_CLEANUP", severity="info",
+                message="cleanup done", auto_resolvable=True),
+            daily_memory_optimization.Issue(
+                code="POSSIBLE_DUPLICATE_REPORT", severity="info",
+                message="3 possible duplicates", auto_resolvable=True),
+            daily_memory_optimization.Issue(
+                code="L3_LINT_REPORT", severity="warning",
+                message="lint done", auto_resolvable=True),
+        ]
+        resolved, unresolved = daily_memory_optimization.try_resolve_issues_with_rules(issues)
+        assert len(resolved) == 3
+        assert len(unresolved) == 0
 
 
 # ============================================================================
