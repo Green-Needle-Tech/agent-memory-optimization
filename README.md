@@ -122,14 +122,15 @@ flowchart LR
         MEM2[L2 Hindsight recall<br/>with metadata]
     end
 
-    subgraph Heuristics["memory_heuristics.py — stdlib only"]
-        IC[classify_importance<br/>weighted scoring + hard rules]
+    subgraph Heuristics["memory_heuristics.py — stdlib only, hard gate"]
+        IC[classify_importance<br/>hard rules + weighted scoring]
         SD[semantic_dedup<br/>exact + structured + lexical]
         CD[detect_contradictions<br/>structured claim comparison]
     end
 
-    subgraph Judge["llm_judge.py — scoped, fail-safe"]
-        J[TypeSafe Jev 1.13<br/>importance + veto-only offload gate<br/>confidence-gated, PII-redacted]
+    subgraph Judge["llm_judge.py — TypeSafe System One (jev-1.13.0), scoped, fail-safe"]
+        JI[judge_importance<br/>weighted-band entries only<br/>essential ↔ offloadable]
+        JG[judge_offload_candidates<br/>rule-offloadable entries only<br/>veto-only + confidence gate]
     end
 
     subgraph Actions
@@ -142,8 +143,11 @@ flowchart LR
     MEM2 --> SD
     MEM2 --> CD
 
-    IC -->|"offloadable candidates"| J
-    J -->|"confirmed / vetoed<br/>(fallback: rules)"| A1
+    IC -- "weighted-band entries" --> JI
+    IC -- "hard-gated: never sent" --> A1
+    JI -- "reclassify (RULE_JEV_IMPORTANCE)<br/>fallback: rule verdict" --> IC
+    IC -- "offloadable candidates" --> JG
+    JG -- "confirmed / vetoed<br/>(confidence ≥ 0.6; fallback: rules)" --> A1
     SD --> A2
     CD --> A3
 
@@ -153,7 +157,7 @@ flowchart LR
     classDef action fill:#1f2937,stroke:#3b82f6,color:#93c5fd
     class MEM1,MEM2 input
     class IC,SD,CD heur
-    class J judge
+    class JI,JG judge
     class A1,A2,A3 action
 ```
 
