@@ -1,6 +1,6 @@
 # agent-memory-optimization — Specification
 
-Version: 3.6.2 (Sep 2026) · Author: Liew Wei Sung · License: MIT
+Version: 3.6.3 (Sep 2026) · Author: Liew Wei Sung · License: MIT
 Repo: https://github.com/Green-Needle-Tech/agent-memory-optimization
 
 A Hermes Agent skill for maintaining a three-layer AI agent memory system: **L1** local always-injected memory (MEMORY.md / USER.md, ~2-4 KB), **L2** semantic recall (Hindsight, localhost:8888), **L3** compiled knowledge (Karpathy-pattern LLM Wiki / OKF bundle). Maintenance is grounded in 2026 agent-memory research: consolidation policy — importance, merge, decay, eviction — is where production memory systems fail, not retrieval.
@@ -9,14 +9,44 @@ A Hermes Agent skill for maintaining a three-layer AI agent memory system: **L1*
 
 | Component | Role |
 |---|---|
-| `scripts/memory_heuristics.py` | Deterministic rule engine (stdlib only): importance classification (hard rules + weighted scoring), semantic dedup, contradiction detection, audit logging, dry-run |
+| `scripts/memory_heuristics.py` | Deterministic rule engine (stdlib only): L1 entry parsing (per-entry, never bulk), importance classification (hard rules + weighted scoring), semantic dedup, contradiction detection, audit logging, dry-run |
 | `scripts/llm_judge.py` | Scoped TypeSafe Jev judge (System One, `jev-1.13.0`): importance refinement + veto-only offload gate, confidence-gated, fail-safe |
 | `scripts/memory_offload.py` | Transactional L1 → L2 offload (cron, 30 min): rules gate first, Jev confirms/vetoes, entry removed only after durable L2 retention |
 | `scripts/daily_memory_optimization.py` | No-agent daily cron: L2 consolidation + smoke-tests, dedup/contradiction passes, Knowledge Pages health, L1 capacity, L3 lint, rule-based auto-resolve, Telegram notify |
 | `scripts/memory_records.py` | Record normalization, PII redaction, sensitive-entry exclusion, paginated scan batches |
 | `scripts/paths.py` | Location-aware resolution (HERMES_HOME, Hindsight URL/bank, .env values, WIKI_DIR) from the existing deployment |
 
-## 2. Decision pipeline (v3.6)
+## 2. L1 entry parsing (v3.6.3)
+
+Every decision in this spec operates on **individual L1 entries, never on a file in bulk**. `memory_heuristics.parse_l1_entries()` is the single parser for MEMORY.md and USER.md, used by `memory_offload.read_memory_file` / `get_memory_usage` and the daily script's `prune_user_md`. Separator precedence (first match wins), with header/rule-line filtering inside each chunk:
+
+```mermaid
+flowchart TD
+    FILE([MEMORY.md / USER.md content]) --> EMPTY{Empty /<br/>whitespace only?}
+    EMPTY -- yes --> NONE([No entries])
+    EMPTY -- no --> HAS_SEC{"'§' line present?<br/>(canonical Hermes L1)"}
+    HAS_SEC -- yes --> SEC["re.split on ^\\s*§\\s*$ lines"]
+    HAS_SEC -- no --> HAS_BLANK{"Blank lines<br/>(\\n\\n) present?"}
+    HAS_BLANK -- yes --> PARA["Split into paragraphs"]
+    HAS_BLANK -- no --> LINE["Split per line<br/>(one entry per line)"]
+    SEC --> FILTER["Per chunk: drop lines starting with<br/>'#' or '---'; rejoin; strip"]
+    PARA --> FILTER
+    LINE --> FILTER
+    FILTER --> ENTRIES([Individual entries → classify per entry])
+
+    classDef file fill:#1f2937,stroke:#6366f1,color:#e5e7eb
+    classDef decision fill:#1f2937,stroke:#f59e0b,color:#fde68a
+    classDef split fill:#1f2937,stroke:#10b981,color:#a7f3d0
+    classDef act fill:#1f2937,stroke:#3b82f6,color:#93c5fd
+    class FILE file
+    class EMPTY,HAS_SEC,HAS_BLANK decision
+    class SEC,PARA,LINE,FILTER split
+    class NONE,ENTRIES act
+```
+
+**Why**: the pre-v3.6.3 parsers split only on `§`; a file without `§` collapsed into a single bulk entry, so classification, offload, and USER.md pruning all judged the whole file as one unit — one hard-offload pattern match could flag the entire file. The parser is deterministic and pure (no I/O), so callers keep their own atomic-write and locking guarantees.
+
+## 3. Decision pipeline (v3.6)
 
 Every L1 entry passes through two stages. The rule engine is the hard gate; the Jev judge is a scoped, fail-safe refinement layer that can never override a hard rule.
 
@@ -73,7 +103,7 @@ flowchart TD
     class ENTRY,KEEP,L2 done
 ```
 
-## 3. Jev judge contract
+## 4. Jev judge contract
 
 **Endpoint**: `POST https://api.typesafe.ai/v1/systemone` · **Model**: `jev-1.13.0` · **Auth**: `Bearer TYPESAFE_API_KEY` (env → `$HERMES_HOME/.env` → `~/.hermes/.env`) · **Attribution**: `X-Title`/`HTTP-Referer` = `Green-Needle-Tech/agent-memory-optimization`.
 
@@ -119,7 +149,7 @@ Response: `answers.{qid}` → `{choice, confidence, probabilities}` (distributio
 
 **Live-verified behavior (Sep 2026)**: importance questions return sharply separated distributions (essential 0.85 / offloadable 0.15, confidence 0.69–0.73); gate questions on ambiguous entries return near-even distributions (confidence 0.08–0.17) which the confidence gate correctly suppresses — the rules stay in charge exactly when Jev signals "I don't know". Full test case in README § v3.6.
 
-## 4. Deterministic rule engine
+## 5. Deterministic rule engine
 
 **Importance**: hard keep (+100: pin, essential prefix), hard offload (−100: explicit tag, offload pattern), quarantine (secret-like), weighted scoring otherwise (threshold ≥ 3 → essential). User-configurable via `$HERMES_HOME/memory_heuristics.json`.
 
@@ -129,7 +159,7 @@ Response: `answers.{qid}` → `{choice, confidence, probabilities}` (distributio
 
 **Auto-resolve allowlist** (fixed, no LLM): `L2_CONSOLIDATION_PENDING` → trigger_consolidation; `L1_CAPACITY_EXCEEDED` → run_memory_offload; `SMOKE_TEST_EXPIRED` / `META_MEMORY_FOUND` / `EXACT_DUPLICATE` / `STRONG_DUPLICATE` → invalidate_exact_memory_id; `STATE_CHANGE_HIGH_CONFIDENCE` → invalidate_exact_older_memory_id; `SMOKE_TEST_CLEANUP` / `META_MEMORY_CLEANUP` / `POSSIBLE_DUPLICATE_REPORT` / `L3_LINT_REPORT` → mark_resolved; `KP_PAGES_STALE` → trigger_consolidation; `L1_USER_NEAR_CAPACITY` → prune_user_md. Destructive actions require `--allow-destructive` / `--apply`.
 
-## 5. Safety invariants
+## 6. Safety invariants
 
 1. An entry is removed from L1 only after confirmed L2 presence or successful L2 retain — failed entries always kept.
 2. Hard rules always outrank the Jev judge; the judge is an enhancement, never a dependency.
@@ -139,7 +169,7 @@ Response: `answers.{qid}` → `{choice, confidence, probabilities}` (distributio
 6. Dry-run mode (`MEMORY_HEURISTICS_DRY_RUN=1` / `--dry-run`) reports proposed actions with rule identifiers, never mutates.
 7. Daily cron: exit 0 always; errors surface via stdout; silent on success.
 
-## 6. Configuration
+## 7. Configuration
 
 | Variable | Default | Description |
 |---|---|---|
@@ -155,12 +185,12 @@ Response: `answers.{qid}` → `{choice, confidence, probabilities}` (distributio
 
 Location resolution (v3.3): `HERMES_HOME` env → deployment dir (Hermes-marker validated) → `~/.hermes` → first `/home/*/.hermes` with markers; `.env` values: process env → `$HERMES_HOME/.env` → `~/.hermes/.env`; Hindsight URL/bank: env → `$HERMES_HOME/hindsight/config.json` → defaults.
 
-## 7. Test coverage
+## 8. Test coverage
 
-184 tests + 2 live-API smokes (auto-skip without `TYPESAFE_API_KEY`): key resolution, availability gating, fail-safe on every failure mode, veto-only semantics, confidence gate, PII redaction / sensitive exclusion, hard-gate isolation, attribution headers, System One payload shape, integration through `memory_offload.classify_entries`, and live `jev-1.13.0` calls for both decision points.
+194 tests + 2 live-API smokes (auto-skip without `TYPESAFE_API_KEY`): key resolution, availability gating, fail-safe on every failure mode, veto-only semantics, confidence gate, PII redaction / sensitive exclusion, hard-gate isolation, attribution headers, System One payload shape, integration through `memory_offload.classify_entries`, and live `jev-1.13.0` calls for both decision points.
 
-## 8. References
+## 9. References
 
 - TypeSafe System One / Choice primitive: docs.typesafe.ai (state + typed questions → typed answers with probability distributions; confidence as the act/no-act axis)
 - Hindsight: hindsight.vectorize.io — consolidation, Knowledge Pages, TEMPR retrieval
-- Consolidation research summary: README § Sources
+- Consolidation research summary: README § v3.6.3, § Sources

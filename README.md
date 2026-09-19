@@ -13,6 +13,35 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
+## v3.6.3 — Per-Entry L1 Parsing (Sep 2026)
+
+L1 MEMORY.md / USER.md content is now classified **per individual memory entry, never in bulk**. New shared parser `memory_heuristics.parse_l1_entries()` (used by `memory_offload.read_memory_file` / `get_memory_usage` and the daily script's USER.md prune) replaces the old inline `§`-only splitting. Previously, an L1 file without a `§` separator collapsed into a single bulk entry — the entire file was then classified as one unit, so a single hard-offload pattern could mark the whole file offloadable. Separator precedence:
+
+```mermaid
+flowchart TD
+    FILE([MEMORY.md / USER.md content]) --> HAS_SEC{"'§' line<br/>present?"}
+    HAS_SEC -- yes --> SPLIT_SEC["Split on §-lines<br/>(canonical Hermes L1 format)"]
+    HAS_SEC -- no --> HAS_BLANK{"Blank lines<br/>(paragraphs) present?"}
+    HAS_BLANK -- yes --> SPLIT_PARA["Split on blank lines<br/>(paragraph entries)"]
+    HAS_BLANK -- no --> SPLIT_LINE["Split on newlines<br/>(one entry per line)"]
+    SPLIT_SEC --> FILTER
+    SPLIT_PARA --> FILTER
+    SPLIT_LINE --> FILTER
+    FILTER["Drop markdown headers (#) and<br/>horizontal rules (---) within chunks"]
+    FILTER --> ENTRIES([List of individual entries<br/>→ classify_importance per entry])
+
+    classDef file fill:#1f2937,stroke:#6366f1,color:#e5e7eb
+    classDef decision fill:#1f2937,stroke:#f59e0b,color:#fde68a
+    classDef split fill:#1f2937,stroke:#10b981,color:#a7f3d0
+    classDef act fill:#1f2937,stroke:#3b82f6,color:#93c5fd
+    class FILE file
+    class HAS_SEC,HAS_BLANK decision
+    class SPLIT_SEC,SPLIT_PARA,SPLIT_LINE,FILTER split
+    class ENTRIES act
+```
+
+The whole file is never returned as a single bulk entry; a file that is one entry still yields one entry, and empty content yields none. 8 new tests (194 total).
+
 ## v3.5 — Full-Coverage Dedup Scan + Observation-Curation Fix (Sep 2026)
 
 Two correctness fixes found during the Sep 2026 full evaluation:
