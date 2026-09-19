@@ -75,6 +75,7 @@ import sys
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import IO
 
 # Rule-based heuristics module (hard gate) + scoped LLM judge (v3.2)
 # paths (v3.3) — location-aware resolution, ships with this repo
@@ -128,14 +129,15 @@ class FileLock:
 
     def __init__(self, lock_path: Path):
         self.lock_path = lock_path
-        self._fd = None
+        self._fd: IO[str] | None = None
 
     def __enter__(self):
         if not _HAS_FCNTL:
             return self
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.lock_path, "w")
-        fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        fd = open(self.lock_path, "w")
+        self._fd = fd
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
         return self
 
     def __exit__(self, *args):

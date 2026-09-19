@@ -95,7 +95,7 @@ def _http_get(url: str, timeout: int = 120) -> dict:
     """GET JSON from URL."""
     req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-        return json.loads(resp.read() or b"{}")
+        return dict(json.loads(resp.read() or b"{}"))
 
 
 def fetch_memory(mid: str) -> MemoryRecord | None:
@@ -159,7 +159,7 @@ def list_memories(
 def load_scan_cursor() -> dict:
     """Load the scan cursor from the previous run."""
     try:
-        return json.loads(SCAN_CURSOR_FILE.read_text())
+        return dict(json.loads(SCAN_CURSOR_FILE.read_text()))
     except Exception:
         return {"offset": 0, "total_seen": 0, "last_run": ""}
 
@@ -377,8 +377,8 @@ def append_audit_log(entry: AuditEntry) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, str(AUDIT_LOG_FILE))
-    except Exception:  # noqa: S110 - best-effort rotation, never block
-        pass
+    except Exception:  # noqa: S110 - best-effort rotation, never block  # nosec B110
+        pass  # noqa: S110
 
 
 def read_audit_log(limit: int = 50, action: str | None = None) -> list[dict]:

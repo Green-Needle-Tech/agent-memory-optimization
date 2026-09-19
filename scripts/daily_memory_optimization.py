@@ -84,6 +84,7 @@ import types
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 # Rule-based heuristics module (v3.0 — replaces llm_judge entirely)
 # paths (v3.3) — location-aware resolution, ships with this repo
@@ -1266,13 +1267,13 @@ def _run_lint_command(wiki_dir):
     proc is a CompletedProcess, or None when the CLI is unavailable.
     cmd_kind is "cli" or "module" (for reporting), or None with proc=None.
     """
-    import shutil
-    import subprocess
+    import shutil  # nosec B404 (fixed argv lint commands, no user input)
+    import subprocess  # nosec B404
     for cmd in _build_lint_commands(wiki_dir):
         try:
             if cmd[0] != sys.executable and not shutil.which(cmd[0]):
                 continue
-            proc = subprocess.run(  # noqa: S603 (fixed argv, no shell)
+            proc = subprocess.run(  # nosec B603 (fixed argv, no shell)
                 cmd, capture_output=True, text=True, timeout=LINT_TIMEOUT_S,
             )
             return proc, "cli" if cmd[0] == "llmwiki" else "module"
@@ -1322,16 +1323,16 @@ def _extract_lint_counts(payload):
                     counts[sev] = max(counts[sev], v)
                 elif isinstance(v, list):
                     counts[sev] = max(counts[sev], len(v))
-    issues_list = None
+    issues_list: list[Any] | None = None
     for key in ("issues", "problems", "findings", "violations"):
         v = payload.get(key)
         if isinstance(v, list) and issues_list is None:
             issues_list = v
     if issues_list is not None:
         for item in issues_list:
-            sev = item.get("severity") or item.get("level") if isinstance(item, dict) else None
-            if sev in counts:
-                counts[sev] += 1
+            item_sev = (item.get("severity") or item.get("level")) if isinstance(item, dict) else None
+            if item_sev in counts:
+                counts[item_sev] += 1
     return pages_scanned, counts
 
 
@@ -1607,7 +1608,7 @@ def main():
         _print_audit_log()
         return
 
-    issues = []
+    issues: list[Issue] = []
 
     # --- 1-2. Trigger consolidation + poll -------------------------------
     final = _run_consolidation(args, issues)

@@ -98,7 +98,7 @@ def resolve_hermes_home() -> Path:
         return Path(env)  # explicit — always wins
     for candidate in _probe_hermes_homes():
         if looks_like_hermes_home(candidate):
-            return candidate
+            return Path(str(candidate))
     return Path.home() / ".hermes"
 
 
