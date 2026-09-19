@@ -164,11 +164,37 @@ def load_scan_cursor() -> dict:
         return {"offset": 0, "total_seen": 0, "last_run": ""}
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON atomically (temp file + fsync + os.replace)."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cursor_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_scan_cursor(cursor: dict) -> None:
-    """Persist the scan cursor for the next run."""
+    """Persist the scan cursor for the next run.
+
+    The cursor path is a module constant derived from the resolved Hermes
+    home (paths.py) — never user input — but we still validate it stays
+    inside that directory (defense in depth against S2083 path traversal).
+    """
     cursor["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    SCAN_CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SCAN_CURSOR_FILE.write_text(json.dumps(cursor))
+    cursor_file = SCAN_CURSOR_FILE.resolve()
+    base_dir = SCAN_CURSOR_FILE.parent.resolve()
+    if not cursor_file.is_relative_to(base_dir):
+        raise ValueError(f"scan cursor path escapes its directory: {cursor_file}")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(cursor_file, cursor)
 
 
 def get_scan_batch(max_records: int = MAX_SCAN_PER_RUN) -> tuple[list[MemoryRecord], int, int]:

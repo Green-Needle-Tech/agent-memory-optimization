@@ -139,7 +139,7 @@ PROTECTED_VALUE_PATTERNS = (
     ("url", re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE), 0),
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), 0),
     ("ip", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), 0),
-    ("port", re.compile(r"\bport\s*(?:is|=|:)?\s*(\d{2,5})\b", re.IGNORECASE), 1),
+    ("port", re.compile(r"\bport\s*(?:is|=:|=|:)?\s*(\d{2,5})\b", re.IGNORECASE), 1),
     ("semver", re.compile(r"\bv?\d+\.\d+(?:\.\d+)?(?:[-+][\w.-]+)?\b"), 0),
     ("model", re.compile(
         r"\b(?:gpt|glm|claude|gemini|gemma|llama|mistral|qwen|deepseek|gpt-oss)[\w.-]*\b",
@@ -159,7 +159,7 @@ _QUOTES_DASHES = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
                   "\u2013": "-", "\u2014": "-", "\u2212": "-"}
 _PUNCT_SEP_RE = re.compile(r"([(),;:!?])")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?]+$")
+_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?]+\Z")
 
 # Negation markers — mismatched negation blocks duplicate collapsing.
 _NEGATION_RE = re.compile(r"\b(?:not|never|no longer|cannot|can't|n't)\b")
@@ -238,23 +238,27 @@ STABLE_ATTRIBUTES = frozenset(
 
 # Claim syntax patterns (v3.0 spec section 9). Applied to normalized,
 # date-stripped, trailing-punctuation-stripped segments.
+# Subject/attribute use plain greedy bounded classes — no lazy quantifiers
+# and no nested quantified groups, so matching stays linear (S8786).
+_SUBJECT = r"(?P<subject>[a-z][\w.-]*(?: [\w.-]+){0,20})"
+_ATTR = r"(?P<attr>[a-z][\w-]*(?: [\w-]+){0,10})"
 _CLAIM_PATTERNS = (
     # <subject>: <attribute>=<value>   /   <subject>: <attribute>: <value>
     re.compile(
-        r"^(?P<subject>[a-z][\w .-]{0,40}?)\s*:\s*(?P<attr>[a-z][\w -]{0,30}?)\s*[=:]\s*(?P<value>.+)$"
+        r"^" + _SUBJECT + r"\s*:\s*" + _ATTR + r"\s*[=:]\s*(?P<value>.+)$"
     ),
     # <subject> <attribute> is <value>
     re.compile(
-        r"^(?P<subject>[a-z][\w .-]{0,40}?)\s+(?P<attr>[a-z][\w -]{0,30}?)\s+is\s+(?P<value>.+)$"
+        r"^" + _SUBJECT + r"\s+" + _ATTR + r"\s+is\s+(?P<value>.+)$"
     ),
     # <subject> uses <value> as <attribute>
     re.compile(
-        r"^(?P<subject>[a-z][\w .-]{0,40}?)\s+uses\s+(?P<value>.+?)\s+as\s+(?:its\s+)?(?P<attr>[a-z][\w -]{0,30}?)$"
+        r"^" + _SUBJECT + r"\s+uses\s+(?P<value>.+?)\s+as\s+(?:its\s+)?" + _ATTR + r"$"
     ),
     # <subject> (was) switched/upgraded/migrated/changed [attr] from <old> to <new>
     re.compile(
-        r"^(?P<subject>[a-z][\w .-]{0,40}?)\s+(?:was\s+)?(?:upgraded|switched|migrated|changed)\s+"
-        r"(?:(?P<attr>[a-z][\w -]{0,30}?)\s+)?from\s+(?P<old>.+?)\s+to\s+(?P<value>.+)$"
+        r"^" + _SUBJECT + r"\s+(?:was\s+)?(?:upgraded|switched|migrated|changed)\s+"
+        r"(?:" + _ATTR + r"\s+)?from\s+(?P<old>.+?)\s+to\s+(?P<value>.+)$"
     ),
 )
 
