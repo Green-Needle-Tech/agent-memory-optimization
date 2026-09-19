@@ -1,6 +1,6 @@
 # agent-memory-optimization — Specification
 
-Version: 3.6.0 (Sep 2026) · Author: Liew Wei Sung · License: MIT
+Version: 3.6.2 (Sep 2026) · Author: Liew Wei Sung · License: MIT
 Repo: https://github.com/Green-Needle-Tech/agent-memory-optimization
 
 A Hermes Agent skill for maintaining a three-layer AI agent memory system: **L1** local always-injected memory (MEMORY.md / USER.md, ~2-4 KB), **L2** semantic recall (Hindsight, localhost:8888), **L3** compiled knowledge (Karpathy-pattern LLM Wiki / OKF bundle). Maintenance is grounded in 2026 agent-memory research: consolidation policy — importance, merge, decay, eviction — is where production memory systems fail, not retrieval.

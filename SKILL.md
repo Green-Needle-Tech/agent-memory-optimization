@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.6.0
+version: 3.6.2
 author: Iris
 license: MIT
 trigger: >-
