@@ -905,7 +905,9 @@ class TestL3StalePageLintTrigger:
     def test_page_age_uses_frontmatter_over_mtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "page.md"
-            p.write_text("---\nupdated: 2026-08-30\n---\nbody\n")
+            # Frontmatter date is relative to today so the test never rots.
+            recent = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 4 * 86400))
+            p.write_text(f"---\nupdated: {recent}\n---\nbody\n")
             old = time.time() - 120 * 86400
             os.utime(p, (old, old))   # mtime says 120 days; frontmatter says ~4
             age = daily_memory_optimization._page_age_days(p)

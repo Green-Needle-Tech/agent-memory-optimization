@@ -189,10 +189,10 @@ class TestReadEnvVar:
     def test_llm_judge_uses_paths(self, monkeypatch, tmp_path):
         """llm_judge.load_api_key resolves via paths (deployment .env)."""
         import llm_judge
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        (tmp_path / ".env").write_text("OPENROUTER_API_KEY=sk-judge\n")
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+        (tmp_path / ".env").write_text("TYPESAFE_API_KEY=apikey-judge\n")
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
-        assert llm_judge.load_api_key() == "sk-judge"
+        assert llm_judge.load_api_key() == "apikey-judge"
 
 
 # ============================================================================

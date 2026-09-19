@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.5.0
+version: 3.6.0
 author: Iris
 license: MIT
 trigger: >-
@@ -17,6 +17,17 @@ metadata:
 ---
 
 # Three-Layer Memory Optimization (L1 / L2 / L3)
+
+## v3.6 — TypeSafe Jev Judge for Importance + Offload Decisions (Sep 2026)
+
+The judge layer now runs on TypeSafe AI's System One API with the Jev model (`jev-1.13.0`, `api.typesafe.ai/v1/systemone`) instead of Gemini 2.5 Flash Lite via OpenRouter. Jev is a structured-decision model: state + typed choice questions → typed answers with confidence — no prompt scaffolding, no JSON parsing of generated prose. Two decision points:
+
+1. **Importance classification** (`llm_judge.judge_importance`, wired into `memory_heuristics.classify_importance_detailed`): reviews only weighted-band entries (no hard rule matched). Jev may reclassify essential ↔ offloadable. Hard-gated decisions (quarantine, pins, essential prefixes, explicit offload tags/patterns) are never overridden. Reclassified decisions carry `RULE_JEV_IMPORTANCE` with the original rule reason preserved.
+2. **Offload gate** (`llm_judge.judge_offload_candidates`): reviews rule-offloadable entries, veto-only (can keep an entry in L1, never unlock an offload).
+
+Invariants preserved from v3.2: rules-first hard gate, fail-safe fallback to rule verdicts on any Jev failure, PII redaction + sensitive-entry exclusion, GNT attribution headers, `JUDGE_ENABLED=0` zero-network disable. New: **confidence gating** — a KEEP veto only applies at confidence ≥ `JUDGE_MIN_CONFIDENCE` (0.6); low-confidence vetoes are ignored (TypeSafe's "confidence says whether to act" semantics). Key: `TYPESAFE_API_KEY` (env → `$HERMES_HOME/.env` → `~/.hermes/.env`).
+
+Live-verified (Sep 2026): both decision points return status "ok" against the real API in ~1.5s; historical provider ranking → offload confirmed, live container state → offload confirmed at the gate (no veto), Hindsight endpoint → essential.
 
 ## v3.5 — Full-Coverage Dedup Scan + Observation-Curation Fix (Sep 2026)
 
@@ -80,15 +91,15 @@ Key findings from agent-memory literature that drive this procedure:
 
 The v3.0 upgrade replaces all LLM-as-judge operations with **deterministic, local rule-based heuristics** (`memory_heuristics.py`). Zero external chat-completion calls. Standard library only.
 
-## Scoped LLM Judge for the Offload Gate (v3.2, Sep 2026)
+## Scoped LLM Judge for the Offload Gate (v3.2, superseded by v3.6 Jev)
 
-v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 → L2 offload gate (`llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter). Design invariants:
+v3.2 reintroduced a **scoped** LLM judge for the L1 → L2 offload gate (`llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter). v3.6 moved this to TypeSafe Jev (see top section). Design invariants:
 
 - **Rules first, judge second.** The rule-based heuristics remain the hard gate (quarantine, pins, essential prefixes, offload patterns, weighted scoring). The judge only reviews entries the rules already marked OFFLOADABLE and can only **VETO** an offload (keep in L1) — it can never unlock one.
 - **Fail-safe, not fail-loud.** Any judge failure (no key, API down, timeout, parse error) falls back to the full rule-based offload set — v3.1 behavior. `JUDGE_ENABLED=0` disables with zero network calls.
 - **Privacy.** Content is PII-redacted (`memory_records.redact_pii`); sensitive/credential-like entries are never sent to the judge and keep their rule-based verdict.
-- **Attribution.** OpenRouter calls carry `X-Title`/`HTTP-Referer` = project name (Green-Needle-Tech/agent-memory-optimization), never localhost.
-- **Config:** `JUDGE_MODEL` (default `google/gemini-2.5-flash-lite`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_TEMPERATURE` (0). Key resolution (v3.3, location-aware): `OPENROUTER_API_KEY` env → `$HERMES_HOME/.env` → `~/.hermes/.env`.
+- **Attribution.** Requests carry `X-Title`/`HTTP-Referer` = project name (Green-Needle-Tech/agent-memory-optimization), never localhost.
+- **Config:** `JUDGE_MODEL` (default `jev-1.13.0`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_MIN_CONFIDENCE` (0.6). Key resolution (v3.3, location-aware): `TYPESAFE_API_KEY` env → `$HERMES_HOME/.env` → `~/.hermes/.env`.
 
 Live-verified behavior (Sep 2026): historical provider rankings and one-time debugging lessons → offload confirmed; volatile container state (current port, restart policy) → vetoed, kept in L1.
 

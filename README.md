@@ -37,9 +37,24 @@ All script locations are now resolved from the **existing deployment**, not just
 
 The repo checkout itself is never mistaken for a Hermes install (marker validation: `config.yaml`, `memories/`, `hindsight/`, `skills/`). Live-verified: scripts deployed under a non-root Hermes home and run with a different `HOME` correctly resolve every location from that deployment.
 
+## v3.6 — TypeSafe Jev Judge for Importance + Offload Decisions (Sep 2026)
+
+v3.6 replaces the OpenRouter chat-completions judge (Gemini 2.5 Flash Lite, v3.2) with **TypeSafe AI's System One structured-decision API** and the **Jev model** (`jev-1.13.0`, `api.typesafe.ai/v1/systemone`). Jev is a decision model, not a text generator: the scripts send a `state` plus a map of typed `choice` questions and get back typed answers with probability distributions — no prompt scaffolding, no JSON parsing of generated prose. It now covers **two** decision points:
+
+1. **Importance classification** (`llm_judge.judge_importance`) — reviews only entries the rule-based heuristics classified via *weighted scoring* (no hard rule matched). Jev may reclassify a weighted-band entry as `essential` or `offloadable`. Hard-gated decisions (quarantine, pins, essential prefixes, explicit offload tags/patterns) are never overridden.
+2. **Offload gate** (`llm_judge.judge_offload_candidates`) — reviews only entries the rules already marked OFFLOADABLE and can only **veto** an offload (keep in L1); it can never unlock one.
+
+- **Rules stay the hard gate** — the judge is an enhancement, not a dependency.
+- **Fail-safe** — any judge failure (no key, API down, timeout, malformed answers) falls back to the full rule-based result. `JUDGE_ENABLED=0` disables it with zero network calls.
+- **Confidence-gated actions** — per TypeSafe's confidence semantics ("the answer says what, confidence says whether to act"), a KEEP veto at the offload gate only applies when confidence ≥ `JUDGE_MIN_CONFIDENCE` (0.6). Low-confidence vetoes are ignored.
+- **Privacy** — content is PII-redacted; sensitive/credential-like entries are never sent to the cloud judge and keep their rule-based verdict.
+- **Attribution** — requests carry `X-Title`/`HTTP-Referer` set to the project name, never localhost.
+
+Config: `JUDGE_MODEL` (default `jev-1.13.0`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_MIN_CONFIDENCE` (0.6). Key resolution (location-aware): `TYPESAFE_API_KEY` env var → `$HERMES_HOME/.env` → `~/.hermes/.env`.
+
 ## v3.2 — Scoped LLM Judge for the Offload Gate (Sep 2026)
 
-v3.0 replaced all LLM-as-judge operations with deterministic rules. v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 → L2 offload gate (`scripts/llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter).
+v3.0 replaced all LLM-as-judge operations with deterministic rules. v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 → L2 offload gate (`scripts/llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter). Superseded by v3.6 (TypeSafe Jev) above.
 
 - **Rules stay the hard gate** — the judge only reviews entries the heuristics already marked OFFLOADABLE, and can only **veto** an offload (keep in L1); it can never unlock one. Quarantined, pinned, and essential-prefix entries never reach the judge.
 - **Fail-safe** — any judge failure (no key, API down, timeout, parse error) falls back to the full rule-based offload set. `JUDGE_ENABLED=0` disables it with zero network calls.
@@ -86,7 +101,7 @@ flowchart LR
     end
 
     subgraph Judge["llm_judge.py — scoped, fail-safe"]
-        J[Gemini 2.5 Flash Lite<br/>veto-only confirmation<br/>PII-redacted]
+        J[TypeSafe Jev 1.13<br/>importance + veto-only offload gate<br/>confidence-gated, PII-redacted]
     end
 
     subgraph Actions
@@ -157,9 +172,10 @@ All locations are resolved from the *existing* deployment, not just the current 
 | `MEMORY_CHARS` | `2200` | L1 MEMORY.md char cap |
 | `USER_CHARS` | `1375` | L1 USER.md char cap |
 | `MEMORY_HEURISTICS_DRY_RUN` | (unset) | Set to `1` to enable dry-run mode |
-| `JUDGE_ENABLED` | `1` | `0` disables the LLM offload judge (zero network calls) |
-| `JUDGE_MODEL` | `google/gemini-2.5-flash-lite` | OpenRouter model for the offload judge |
-| `OPENROUTER_API_KEY` | `$HERMES_HOME/.env` → `~/.hermes/.env` | Judge API key (env var wins; judge auto-disabled when absent) |
+| `JUDGE_ENABLED` | `1` | `0` disables the TypeSafe Jev judge (zero network calls) |
+| `JUDGE_MODEL` | `jev-1.13.0` | TypeSafe System One model for importance + offload decisions |
+| `JUDGE_MIN_CONFIDENCE` | `0.6` | Minimum Jev confidence for a KEEP veto to apply |
+| `TYPESAFE_API_KEY` | `$HERMES_HOME/.env` → `~/.hermes/.env` | TypeSafe API key (env var wins; judge auto-disabled when absent) |
 
 ### Optional configuration
 

@@ -1,14 +1,14 @@
-"""Tests for the scoped Gemini 2.5 Flash Lite judge (v3.2).
+"""Tests for the scoped TypeSafe Jev judge (v3.6).
 
 Covers:
   - Key resolution (env var, ~/.hermes/.env, absent)
   - Availability gating (JUDGE_ENABLED=0, no key)
-  - Prompt building: PII redaction, sensitive-entry exclusion, cap
-  - Verdict parsing: clean JSON, fenced JSON, prose-wrapped, malformed,
-    unknown ids, out-of-range ids, conservative defaults
-  - Fail-safe behavior: API error / timeout / parse failure -> full
-    rule-based offload set with status "fallback"
-  - Veto semantics: judge can only veto, never unlock
+  - State building: PII redaction, sensitive-entry exclusion, cap
+  - Offload gate: fail-safe (API error / malformed answers), veto-only
+    semantics, confidence gate on KEEP vetoes, unsent entries keep rule
+    verdict
+  - Importance classification: essential/offloadable verdicts, unknown
+    choices ignored, fail-safe
   - Integration: memory_offload.classify_entries with judge veto
   - Attribution headers: project name, not localhost
 """
@@ -30,33 +30,33 @@ import memory_offload
 
 class TestKeyResolution:
     def test_env_var_key(self, monkeypatch):
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
-        assert llm_judge.load_api_key() == "sk-test-123"
+        monkeypatch.setenv("TYPESAFE_API_KEY", "apikey-test-123")
+        assert llm_judge.load_api_key() == "apikey-test-123"
 
     def test_hermes_env_file(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
         env_file = tmp_path / ".env"
-        env_file.write_text("OTHER=x\nOPENROUTER_API_KEY=\"sk-from-file\"\n")
+        env_file.write_text("OTHER=x\nTYPESAFE_API_KEY=\"apikey-from-file\"\n")
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
-        assert llm_judge.load_api_key() == "sk-from-file"
+        assert llm_judge.load_api_key() == "apikey-from-file"
 
     def test_no_key(self, monkeypatch, tmp_path):
-        # v3.3: key resolution falls back to ~/.hermes/.env — pin HOME so the
+        # Key resolution falls back to ~/.hermes/.env — pin HOME so the
         # test stays hermetic on hosts that have a real key there.
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
         assert llm_judge.load_api_key() is None
 
     def test_is_available_no_key(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
         assert llm_judge.is_available() is False
 
     def test_is_available_disabled(self, monkeypatch):
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
+        monkeypatch.setenv("TYPESAFE_API_KEY", "apikey-test-123")
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", False)
         assert llm_judge.is_available() is False
 
@@ -68,6 +68,10 @@ class TestKeyResolution:
 class TestFailSafe:
     ENTRIES = [(0, "Completed task X last week"), (1, "Old provider ranking")]
 
+    def _armed(self, monkeypatch):
+        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
+        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "apikey-test")
+
     def test_disabled_returns_all(self, monkeypatch):
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", False)
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(self.ENTRIES)
@@ -77,7 +81,7 @@ class TestFailSafe:
 
     def test_no_key_returns_all(self, monkeypatch, tmp_path):
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))  # hermetic: no ~/.hermes/.env fallback
         monkeypatch.setattr(llm_judge, "HERMES_HOME", tmp_path)
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(self.ENTRIES)
@@ -85,148 +89,161 @@ class TestFailSafe:
         assert status == "disabled"
 
     def test_api_failure_falls_back(self, monkeypatch):
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
-        monkeypatch.setattr(llm_judge, "_call_openrouter", lambda p, k: None)
+        self._armed(monkeypatch)
+        monkeypatch.setattr(llm_judge, "_call_systemone", lambda s, q: None)
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(self.ENTRIES)
         assert confirmed == [0, 1]
         assert vetoed == []
         assert status == "fallback"
 
-    def test_malformed_response_falls_back(self, monkeypatch):
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
-        monkeypatch.setattr(llm_judge, "_call_openrouter", lambda p, k: "not json at all")
+    def test_malformed_answers_fall_back(self, monkeypatch):
+        self._armed(monkeypatch)
+        monkeypatch.setattr(llm_judge, "_call_systemone", lambda s, q: {"unexpected": True})
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(self.ENTRIES)
         assert confirmed == [0, 1]
         assert status == "fallback"
 
     def test_empty_candidates(self, monkeypatch):
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
+        self._armed(monkeypatch)
         confirmed, vetoed, status = llm_judge.judge_offload_candidates([])
         assert confirmed == []
         assert status == "skipped"
 
 
 # ============================================================================
-# Verdict parsing
+# Veto semantics + confidence gate
 # ============================================================================
 
-class TestVerdictParsing:
-    def test_clean_json(self):
-        text = '{"verdicts": [{"id": 0, "verdict": "offload"}, {"id": 1, "verdict": "keep"}]}'
-        v = llm_judge._parse_verdicts(text, [10, 11])
-        assert v == {10: "offload", 11: "keep"}
+def _answers(verdicts):
+    """Build a System One `answers` body: {qid: {choice, confidence}}."""
+    return {f"e{i}": v for i, v in enumerate(verdicts)}
 
-    def test_fenced_json(self):
-        text = '```json\n{"verdicts": [{"id": 0, "verdict": "keep"}]}\n```'
-        v = llm_judge._parse_verdicts(text, [5])
-        assert v == {5: "keep"}
-
-    def test_prose_wrapped_json(self):
-        text = 'Here is my judgment:\n{"verdicts": [{"id": 0, "verdict": "OFFLOAD"}]}\nDone.'
-        v = llm_judge._parse_verdicts(text, [7])
-        assert v == {7: "offload"}
-
-    def test_unknown_verdict_defaults_keep(self):
-        text = '{"verdicts": [{"id": 0, "verdict": "maybe"}]}'
-        v = llm_judge._parse_verdicts(text, [3])
-        assert v == {3: "keep"}
-
-    def test_missing_id_skipped(self):
-        text = '{"verdicts": [{"verdict": "keep"}]}'
-        v = llm_judge._parse_verdicts(text, [3])
-        assert v == {}
-
-    def test_out_of_range_id_skipped(self):
-        text = '{"verdicts": [{"id": 99, "verdict": "keep"}]}'
-        v = llm_judge._parse_verdicts(text, [3])
-        assert v == {}
-
-    def test_malformed_returns_none(self):
-        assert llm_judge._parse_verdicts("garbage", [0]) is None
-        assert llm_judge._parse_verdicts('{"verdicts": "not-a-list"}', [0]) is None
-
-
-# ============================================================================
-# Veto semantics: judge can only veto, never unlock
-# ============================================================================
 
 class TestVetoSemantics:
-    def test_vetoed_entries_kept(self, monkeypatch):
+    def _armed(self, monkeypatch, answers):
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
-        response = json.dumps({"verdicts": [
-            {"id": 0, "verdict": "offload"},
-            {"id": 1, "verdict": "keep"},
-        ]})
-        monkeypatch.setattr(llm_judge, "_call_openrouter", lambda p, k: response)
+        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "apikey-test")
+        monkeypatch.setattr(llm_judge, "_call_systemone", lambda s, q: answers)
+
+    def test_vetoed_entries_kept(self, monkeypatch):
+        self._armed(monkeypatch, _answers([
+            {"choice": "offload", "confidence": 0.9},
+            {"choice": "keep", "confidence": 0.95},
+        ]))
         entries = [(0, "Completed task A"), (1, "Live incident ongoing")]
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(entries)
         assert confirmed == [0]
         assert vetoed == [1]
         assert status == "ok"
 
+    def test_low_confidence_keep_ignored(self, monkeypatch):
+        """KEEP below JUDGE_MIN_CONFIDENCE does not veto — rule offload stands."""
+        self._armed(monkeypatch, _answers([
+            {"choice": "keep", "confidence": 0.4},
+        ]))
+        confirmed, vetoed, status = llm_judge.judge_offload_candidates([(0, "Completed task A")])
+        assert confirmed == [0]
+        assert vetoed == []
+        assert status == "ok"
+
     def test_unsent_entries_keep_rule_verdict(self, monkeypatch):
-        """Sensitive entries excluded from the prompt still offload (rule verdict)."""
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
+        """Sensitive entries excluded from the state still offload (rule verdict)."""
+        captured = {}
 
-        def fake_call(prompt, key):
-            # Judge only saw the non-sensitive entry (position 0 -> candidate 0)
-            assert "sk-secret1234567890abcdef" not in prompt
-            assert "Completed task A" in prompt
-            return json.dumps({"verdicts": [{"id": 0, "verdict": "offload"}]})
+        def fake_call(state, questions):
+            captured["state"] = state
+            return _answers([{"choice": "offload", "confidence": 0.9}])
 
-        monkeypatch.setattr(llm_judge, "_call_openrouter", fake_call)
-        entries = [(0, "Completed task A"), (1, "the api_key: sk-secret1234567890abcdef")]
+        self._armed(monkeypatch, None)
+        monkeypatch.setattr(llm_judge, "_call_systemone", fake_call)
+        entries = [(0, "Completed task A"), (1, "the api_key: «redacted:sk-…»")]
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(entries)
-        # Sensitive entry was never sent but keeps its rule-based offload verdict
+        assert "redacted:sk" not in captured["state"]
+        assert "Completed task A" in captured["state"]
         assert confirmed == [0, 1]
         assert vetoed == []
         assert status == "ok"
 
+    def test_missing_answer_keeps_rule_verdict(self, monkeypatch):
+        self._armed(monkeypatch, {})  # no answers at all
+        confirmed, vetoed, status = llm_judge.judge_offload_candidates([(0, "Completed task A")])
+        assert confirmed == [0]
+        assert status == "fallback"
+
 
 # ============================================================================
-# Prompt building and privacy
+# State building and privacy
 # ============================================================================
 
-class TestPromptPrivacy:
-    def test_pii_redacted_in_prompt(self):
+class TestStatePrivacy:
+    def test_pii_redacted_in_state(self):
         email = "alice" + "@" + "example.com"
-        prompt, sent = llm_judge._build_prompt([
+        lines, sent = llm_judge._prepare([
             (0, f"Contact {email} about the completed migration"),
         ])
-        assert email not in prompt
-        assert "[EMAIL]" in prompt
+        assert email not in lines[0]
+        assert "[EMAIL]" in lines[0]
         assert sent == [0]
 
     def test_sensitive_entry_excluded(self):
-        prompt, sent = llm_judge._build_prompt([
+        lines, sent = llm_judge._prepare([
             (0, "Completed task A"),
             (1, "the password: hunter2secret"),
         ])
-        assert prompt is not None
-        assert "hunter2secret" not in prompt
+        assert lines
+        assert "hunter2secret" not in lines[0]
         assert sent == [0]
 
-    def test_all_sensitive_returns_none(self):
-        prompt, sent = llm_judge._build_prompt([(0, "the password: hunter2secret")])
-        assert prompt is None
+    def test_all_sensitive_returns_empty(self):
+        lines, sent = llm_judge._prepare([(0, "the password: hunter2secret")])
+        assert lines == []
         assert sent == []
 
     def test_cap_respected(self, monkeypatch):
         monkeypatch.setattr(llm_judge, "JUDGE_MAX_ENTRIES", 3)
         entries = [(i, f"Completed task {i}") for i in range(10)]
-        prompt, sent = llm_judge._build_prompt(entries)
+        lines, sent = llm_judge._prepare(entries)
         assert sent == [0, 1, 2]
 
-    def test_prompt_contains_role_definition(self):
-        prompt, _ = llm_judge._build_prompt([(0, "Completed task A")])
-        assert "offload" in prompt
-        assert "keep" in prompt
-        assert "JSON" in prompt
+
+# ============================================================================
+# Importance classification (v3.6)
+# ============================================================================
+
+class TestJudgeImportance:
+    def _armed(self, monkeypatch, answers):
+        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
+        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "apikey-test")
+        monkeypatch.setattr(llm_judge, "_call_systemone", lambda s, q: answers)
+
+    def test_essential_and_offloadable_verdicts(self, monkeypatch):
+        self._armed(monkeypatch, _answers([
+            {"choice": "essential", "confidence": 0.9},
+            {"choice": "offloadable", "confidence": 0.85},
+        ]))
+        verdicts, status = llm_judge.judge_importance([
+            (0, "Hindsight endpoint localhost 8888"), (1, "Old provider ranking"),
+        ])
+        assert verdicts == {0: "essential", 1: "offloadable"}
+        assert status == "ok"
+
+    def test_unknown_choice_ignored(self, monkeypatch):
+        self._armed(monkeypatch, _answers([{"choice": "maybe", "confidence": 0.9}]))
+        verdicts, status = llm_judge.judge_importance([(0, "some entry")])
+        assert verdicts == {}
+        assert status == "fallback"
+
+    def test_disabled(self, monkeypatch):
+        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", False)
+        verdicts, status = llm_judge.judge_importance([(0, "some entry")])
+        assert verdicts == {}
+        assert status == "disabled"
+
+    def test_api_failure_falls_back(self, monkeypatch):
+        self._armed(monkeypatch, None)
+        verdicts, status = llm_judge.judge_importance([(0, "some entry")])
+        assert verdicts == {}
+        assert status == "fallback"
 
 
 # ============================================================================
@@ -234,9 +251,9 @@ class TestPromptPrivacy:
 # ============================================================================
 
 class TestAttribution:
-    def test_headers_sent(self, monkeypatch):
+    def test_headers_and_payload(self, monkeypatch):
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
+        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "apikey-test")
         captured = {}
 
         def fake_urlopen(req, timeout=None):
@@ -252,8 +269,8 @@ class TestAttribution:
 
                 def read(self):
                     return json.dumps({
-                        "choices": [{"message": {"content": '{"verdicts": []}'}}
-                    ]}).encode()
+                        "answers": {"e0": {"choice": "offload", "confidence": 0.9}}
+                    }).encode()
 
             return FakeResp()
 
@@ -264,7 +281,13 @@ class TestAttribution:
         assert headers["x-title"] == llm_judge.PROJECT_NAME
         assert headers["http-referer"] == f"https://github.com/{llm_judge.PROJECT_NAME}"
         assert "localhost" not in headers["http-referer"]
-        assert captured["data"]["model"] == llm_judge.JUDGE_MODEL
+        assert headers["authorization"] == "Bearer apikey-test"
+        data = captured["data"]
+        assert data["model"] == llm_judge.JUDGE_MODEL
+        assert "state" in data and "questions" in data
+        q = data["questions"]["e0"]
+        assert q["type"] == "choice"
+        assert set(q["criteria"]) == {"offload", "keep"}
 
 
 # ============================================================================
@@ -272,23 +295,21 @@ class TestAttribution:
 # ============================================================================
 
 class TestClassifyEntriesWithJudge:
+    def _armed(self, monkeypatch, answers):
+        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
+        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "apikey-test")
+        monkeypatch.setattr(llm_judge, "_call_systemone", lambda s, q: answers)
+
     def test_vetoed_entry_stays_in_offload_pipeline(self, monkeypatch):
         """Vetoed entries must NOT be offloaded — they stay out of `offloadable`."""
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
-        response = json.dumps({"verdicts": [{"id": 0, "verdict": "keep"}]})
-        monkeypatch.setattr(llm_judge, "_call_openrouter", lambda p, k: response)
-
+        self._armed(monkeypatch, _answers([{"choice": "keep", "confidence": 0.95}]))
         entries = ["IrisBot: Linux 6.8 specs", "Completed task A"]
         essential, offloadable = memory_offload.classify_entries(entries)
         assert len(essential) == 1
         assert offloadable == []  # judge vetoed the only offload candidate
 
     def test_fallback_offloads_everything(self, monkeypatch):
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
-        monkeypatch.setattr(llm_judge, "_call_openrouter", lambda p, k: None)
-
+        self._armed(monkeypatch, None)
         entries = ["IrisBot: Linux 6.8 specs", "Completed task A", "Old provider ranking"]
         essential, offloadable = memory_offload.classify_entries(entries)
         assert len(essential) == 1
@@ -296,17 +317,18 @@ class TestClassifyEntriesWithJudge:
 
     def test_hard_gate_untouched_by_judge(self, monkeypatch):
         """The judge never sees hard-kept entries — pins stay essential regardless."""
-        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
-        monkeypatch.setattr(llm_judge, "load_api_key", lambda: "sk-test")
+        captured = {}
 
-        def fake_call(prompt, key):
-            assert "[pin]" not in prompt
-            assert "secret" not in prompt
-            return json.dumps({"verdicts": []})
+        def fake_call(state, questions):
+            captured["state"] = state
+            return {}
 
-        monkeypatch.setattr(llm_judge, "_call_openrouter", fake_call)
-        entries = ["[pin] critical safety rule", "the api_key: sk-secret1234567890", "Completed task A"]
+        self._armed(monkeypatch, None)
+        monkeypatch.setattr(llm_judge, "_call_systemone", fake_call)
+        entries = ["[pin] critical safety rule", "the api_key: «redacted:sk-…»", "Completed task A"]
         essential, offloadable = memory_offload.classify_entries(entries)
+        assert "[pin]" not in captured["state"]
+        assert "redacted:sk" not in captured["state"]
         assert any("[pin]" in e for e in essential)
         assert any("api_key" in e for e in essential)  # quarantined stays local
         assert len(offloadable) == 1
@@ -319,11 +341,23 @@ class TestClassifyEntriesWithJudge:
 class TestLiveSmoke:
     def test_live_call_if_available(self, monkeypatch):
         import os
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            pytest.skip("no OPENROUTER_API_KEY in environment")
+        if not os.environ.get("TYPESAFE_API_KEY"):
+            pytest.skip("no TYPESAFE_API_KEY in environment")
         monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
         entries = [(0, "Completed migration of provider ranking last month")]
         confirmed, vetoed, status = llm_judge.judge_offload_candidates(entries)
         assert status in ("ok", "fallback")
         if status == "ok":
             assert confirmed == [0] or vetoed == [0]
+
+    def test_live_importance_if_available(self, monkeypatch):
+        import os
+        if not os.environ.get("TYPESAFE_API_KEY"):
+            pytest.skip("no TYPESAFE_API_KEY in environment")
+        monkeypatch.setattr(llm_judge, "JUDGE_ENABLED", True)
+        verdicts, status = llm_judge.judge_importance([
+            (0, "Hindsight memory server runs at localhost 8888 with bank main"),
+        ])
+        assert status in ("ok", "fallback")
+        if status == "ok":
+            assert verdicts.get(0) in ("essential", "offloadable")

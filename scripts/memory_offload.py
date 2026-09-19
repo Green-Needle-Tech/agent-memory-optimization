@@ -5,6 +5,22 @@ Runs via cron (no_agent=True). When local MEMORY.md exceeds the capacity
 threshold, offloads non-essential entries to Hindsight and removes them
 from local memory.
 
+v3.6 (Sep 2026): TypeSafe Jev judge (System One, jev-1.13.0).
+  - Replaces the OpenRouter chat-completions judge (v3.2) with TypeSafe
+    System One structured decisions: state + typed choice questions ->
+    typed answers with confidence. No prompt scaffolding, no JSON parsing.
+  - Two decision points: importance classification for weighted-band
+    entries (llm_judge.judge_importance) and the offload gate
+    (llm_judge.judge_offload_candidates, veto-only)
+  - Confidence-gated: a KEEP veto only applies at confidence >=
+    JUDGE_MIN_CONFIDENCE (0.6); low-confidence vetoes are ignored
+  - Rule-based heuristics remain the hard gate; any Jev failure falls
+    back to the rule-based result
+  - Privacy: content is PII-redacted; sensitive entries never reach the
+    judge (see llm_judge.py + memory_records.prepare_for_judging)
+  - Key: TYPESAFE_API_KEY (env -> $HERMES_HOME/.env -> ~/.hermes/.env)
+  - Disable with JUDGE_ENABLED=0
+
 v3.2 (Sep 2026): Scoped LLM judge for the offload gate.
   - Rule-based heuristics remain the hard gate (quarantine, pins,
     essential prefixes, offload patterns, weighted scoring)

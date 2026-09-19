@@ -613,6 +613,41 @@ def classify_importance_detailed(entries, context=None):
             matched_rules=tuple(matched),
             reason=reason,
         ))
+    # v3.6: scoped Jev (TypeSafe System One) refinement for weighted-band
+    # entries only — hard-gated decisions (quarantine, pins, essential
+    # prefixes, explicit offload tags/patterns) are never overridden.
+    # Fail-safe: any judge failure leaves the rule verdicts untouched.
+    llm_judge = None
+    jev_verdicts = None
+    try:
+        import llm_judge  # noqa: E402  (circular-free: lazy import)
+
+        if llm_judge.is_available():
+            weighted = [
+                (d.index, entries[d.index])
+                for d in decisions
+                if d.disposition in ("essential", "offloadable")
+                and any(r.startswith("RULE_WEIGHTED") or "weighted rules" in r or "no rules matched" in r
+                        for r in (d.reason,))
+            ]
+            if weighted:
+                jev_verdicts, _status = llm_judge.judge_importance(weighted)
+    except Exception:
+        jev_verdicts = None
+
+    if jev_verdicts and llm_judge is not None:
+        refined = []
+        for d in decisions:
+            verdict = jev_verdicts.get(d.index)
+            if verdict in ("essential", "offloadable") and verdict != d.disposition:
+                refined.append(ImportanceDecision(
+                    index=d.index, disposition=verdict, score=d.score,
+                    matched_rules=d.matched_rules + ("RULE_JEV_IMPORTANCE",),
+                    reason=f"{d.reason}; Jev ({llm_judge.JUDGE_MODEL}) reclassified as {verdict}",
+                ))
+            else:
+                refined.append(d)
+        decisions = refined
     return decisions
 
 
