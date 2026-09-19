@@ -159,7 +159,7 @@ _QUOTES_DASHES = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
                   "\u2013": "-", "\u2014": "-", "\u2212": "-"}
 _PUNCT_SEP_RE = re.compile(r"([(),;:!?])")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?]+\Z")
+_TRAILING_PUNCT = ".,;:!?"  # stripped via str.rstrip (linear, no regex)
 
 # Negation markers — mismatched negation blocks duplicate collapsing.
 _NEGATION_RE = re.compile(r"\b(?:not|never|no longer|cannot|can't|n't)\b")
@@ -307,7 +307,7 @@ def normalize_text(content: str) -> NormalizedMemory:
     text = _PUNCT_SEP_RE.sub(r" \1 ", text)
     text = re.sub(r"\s+", " ", text).strip()
     # Trailing punctuation removal (exact-dup hash consistency)
-    text = _TRAILING_PUNCT_RE.sub("", text)
+    text = text.rstrip(_TRAILING_PUNCT)
 
     tokens = frozenset(_TOKEN_RE.findall(text))
     significant = frozenset(t for t in tokens if t not in STOP_WORDS and len(t) > 1)
@@ -379,7 +379,7 @@ def _parse_claims(normalized: str) -> list[Claim]:
     # Sentence-ish segmentation.
     segments = [s.strip() for s in re.split(r"[.;] ", normalized) if s.strip()]
     for seg in segments:
-        seg = _TRAILING_PUNCT_RE.sub("", seg)
+        seg = seg.rstrip(_TRAILING_PUNCT)
         # Leading date prefix ("2026-08-01: Hindsight ...") -> claim timestamp.
         seg_ts = None
         dm = _LEADING_DATE_RE.match(seg)
