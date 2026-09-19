@@ -52,6 +52,34 @@ v3.6 replaces the OpenRouter chat-completions judge (Gemini 2.5 Flash Lite, v3.2
 
 Config: `JUDGE_MODEL` (default `jev-1.13.0`), `JUDGE_TIMEOUT` (30s), `JUDGE_MAX_ENTRIES` (40), `JUDGE_MIN_CONFIDENCE` (0.6). Key resolution (location-aware): `TYPESAFE_API_KEY` env var → `$HERMES_HOME/.env` → `~/.hermes/.env`.
 
+### Live test case (real API, Sep 2026)
+
+Four entries sent to both decision points (`jev-1.13.0`, ~1.4–2.9s per call):
+
+```
+0: User prefers concise responses with bullet points and key:value pairs
+1: Live incident: Hindsight recall returning empty messages since 14:00, debugging in progress
+2: In March we evaluated Firebase vs Cognito for auth and eliminated both; final decision recorded
+3: Hindsight memory server runs at localhost 8888, bank main, gpt-oss-120b via Cerebras
+```
+
+**Importance classification** — clear verdicts, high confidence:
+
+| entry | choice | confidence | probabilities |
+|-------|--------|-----------|---------------|
+| 0 preference | essential | 0.71 | essential 0.85 / offloadable 0.15 |
+| 1 live incident | essential | 0.70 | essential 0.85 / offloadable 0.15 |
+| 2 completed eval | essential | 0.73 | essential 0.87 / offloadable 0.13 |
+| 3 endpoint config | essential | 0.69 | essential 0.85 / offloadable 0.15 |
+
+**Offload gate** — every answer came back `keep` but with confidence 0.08–0.17 and near-even distributions (keep 0.54–0.58 / offload 0.42–0.46). Because all confidences sit far below `JUDGE_MIN_CONFIDENCE` (0.6), **no veto was applied** — the rule-based offload verdicts stood (`gate result: ok, confirmed [0,1,2,3], vetoed []`).
+
+Findings:
+
+- The confidence gate does real work. Jev's low-confidence `keep`s on the gate question are effectively "I don't know" signals (TypeSafe docs: low confidence means ambiguous criteria or insufficient state) — exactly the case where the deterministic rules should stay in charge. Without the gate, these four near-coin-flip answers would have wrongly blocked every offload.
+- The importance question (essential vs offloadable) produced sharply separated distributions (0.85+ vs 0.15) — the two-option rubric with WHAT/NOT FOR/EXAMPLES criteria is well-posed for Jev. The gate question as currently phrased is more confusable to the model; a future revision may sharpen the `keep`/`offload` criteria or decompose the gate into more atomic per-entry questions.
+- Honest caveat: Jev scored the completed Firebase/Cognito evaluation as `essential` at high confidence (0.73) — arguably wrong for a settled historical decision. This is why Jev only refines the *weighted band*: hard offload rules (explicit tags, offload patterns like "eliminated both; final decision recorded") still override it, and every reclassification is audited as `RULE_JEV_IMPORTANCE` with the original rule reason preserved.
+
 ## v3.2 — Scoped LLM Judge for the Offload Gate (Sep 2026)
 
 v3.0 replaced all LLM-as-judge operations with deterministic rules. v3.2 reintroduces a **scoped** LLM judge for exactly one decision point: the L1 → L2 offload gate (`scripts/llm_judge.py`, Gemini 2.5 Flash Lite via OpenRouter). Superseded by v3.6 (TypeSafe Jev) above.
