@@ -198,14 +198,9 @@ def read_memory_file():
     if not MEMORY_FILE.exists():
         return []
     content = MEMORY_FILE.read_text(encoding="utf-8")
-    # Entries are separated by lines containing only '§'
-    raw_entries = content.split("§") if "§" in content else [content]
-    entries = []
-    for item in raw_entries:
-        stripped = item.strip()
-        if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
-            entries.append(stripped)
-    return entries
+    # v3.6.3: per-entry parsing — §-lines, else blank lines, else one per
+    # line. Never treats the whole file as a single bulk entry.
+    return memory_heuristics.parse_l1_entries(content)
 
 
 def get_memory_usage():
@@ -213,11 +208,8 @@ def get_memory_usage():
     if not MEMORY_FILE.exists():
         return 0, CAPACITY_MAX
     content = MEMORY_FILE.read_text(encoding="utf-8")
-    if "§" in content:
-        entries = [e.strip() for e in content.split("§") if e.strip()]
-        total_chars = sum(len(e) for e in entries)
-    else:
-        total_chars = len(content)
+    entries = memory_heuristics.parse_l1_entries(content)
+    total_chars = sum(len(e) for e in entries)
     return total_chars, CAPACITY_MAX
 
 

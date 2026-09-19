@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.6.2
+version: 3.6.3
 author: Iris
 license: MIT
 trigger: >-
@@ -17,6 +17,10 @@ metadata:
 ---
 
 # Three-Layer Memory Optimization (L1 / L2 / L3)
+
+## v3.6.3 — Per-Entry L1 Parsing (Sep 2026)
+
+`memory_heuristics.parse_l1_entries()` is now the single parser for MEMORY.md and USER.md. Classification always runs **per individual memory entry, never in bulk**: separator precedence is `§`-lines → blank lines (paragraphs) → one entry per line. Previously, files without a `§` separator collapsed into a single bulk entry, so the entire file was classified as one unit. Used by `memory_offload.read_memory_file`/`get_memory_usage` and the daily script's USER.md prune.
 
 ## v3.6 — TypeSafe Jev Judge for Importance + Offload Decisions (Sep 2026)
 

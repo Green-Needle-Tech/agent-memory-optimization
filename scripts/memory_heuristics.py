@@ -436,6 +436,41 @@ def _normalize_all(entries):
 
 # === Configuration ===
 
+# === L1 entry parsing (v3.6.3) ===
+
+def parse_l1_entries(content: str) -> list[str]:
+    """Split MEMORY.md / USER.md content into individual L1 entries.
+
+    Never returns the whole file as one bulk entry. Separator precedence:
+      1. Lines consisting only of '§' (canonical Hermes L1 format).
+      2. Blank lines (paragraph-separated entries).
+      3. Single newlines (one entry per line — L1 files where each memory
+         sits on its own line with no blank lines between).
+
+    Markdown headers ('#') and horizontal rules ('---') are skipped.
+    """
+    if not content or not content.strip():
+        return []
+    if "§" in content:
+        raw = re.split(r"(?m)^\s*§\s*$", content)
+    elif "\n\n" in content.strip():
+        raw = content.strip().split("\n\n")
+    else:
+        raw = content.splitlines()
+    entries = []
+    for item in raw:
+        # Drop markdown header / horizontal-rule lines within each chunk
+        lines = [ln for ln in item.splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")
+                 and not ln.strip().startswith("---")]
+        if not lines:
+            continue
+        stripped = "\n".join(lines).strip()
+        if stripped:
+            entries.append(stripped)
+    return entries
+
+
 def load_config():
     """Load ~/.hermes/memory_heuristics.json; warn + defaults on invalid."""
     defaults = {

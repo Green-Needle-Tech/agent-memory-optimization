@@ -366,16 +366,9 @@ def _prune_user_md(issue):
         return None
     try:
         content = USER_FILE.read_text(encoding="utf-8")
-        # Parse entries (same §-separated format as MEMORY.md)
-        if "§" in content:
-            raw_entries = content.split("§")
-        else:
-            raw_entries = [content]
-        entries = []
-        for item in raw_entries:
-            stripped = item.strip()
-            if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
-                entries.append(stripped)
+        # v3.6.3: per-entry parsing (same helper as MEMORY.md) — §-lines,
+        # else blank lines, else one entry per line. Never bulk.
+        entries = memory_heuristics.parse_l1_entries(content)
         if not entries:
             return None
 

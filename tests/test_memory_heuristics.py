@@ -645,3 +645,54 @@ class TestConfig:
             with patch.object(mh, "CONFIG_FILE", config_file):
                 cfg = mh.load_config()
                 assert "Production API:" in cfg["essential_prefixes"]
+
+
+# ============================================================================
+# L1 entry parsing (v3.6.3 — per-entry classification, never bulk)
+# ============================================================================
+
+class TestParseL1Entries:
+    """parse_l1_entries must return individual entries for every L1 format."""
+
+    def test_section_sign_separated(self):
+        content = "Entry one.\n§\nEntry two.\n§\nEntry three."
+        assert mh.parse_l1_entries(content) == ["Entry one.", "Entry two.", "Entry three."]
+
+    def test_blank_line_separated(self):
+        content = "Entry one.\n\nEntry two.\n\nEntry three."
+        assert mh.parse_l1_entries(content) == ["Entry one.", "Entry two.", "Entry three."]
+
+    def test_single_newline_separated(self):
+        """One entry per line (no §, no blank lines) — the bulk bug case."""
+        content = "Entry one.\nEntry two.\nEntry three."
+        assert mh.parse_l1_entries(content) == ["Entry one.", "Entry two.", "Entry three."]
+
+    def test_never_returns_whole_file_as_one_entry(self):
+        """Regression: files without § used to collapse into ONE bulk entry."""
+        content = "Hindsight: localhost:8888, bank main.\nIrisBot: Linux host.\nKey: /opt/hindsight/.env"
+        entries = mh.parse_l1_entries(content)
+        assert len(entries) == 3
+
+    def test_headers_and_rules_skipped(self):
+        content = "# MEMORY\n\n---\n\nEntry one.\n§\nEntry two."
+        assert mh.parse_l1_entries(content) == ["Entry one.", "Entry two."]
+
+    def test_empty_content(self):
+        assert mh.parse_l1_entries("") == []
+        assert mh.parse_l1_entries("   \n  \n") == []
+
+    def test_single_entry(self):
+        assert mh.parse_l1_entries("Only entry.") == ["Only entry."]
+
+    def test_offload_parsing_integration(self):
+        """memory_offload.read_memory_file must classify per-entry (mock file)."""
+        import memory_offload as mo
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td) / "MEMORY.md"
+            mem.write_text("IrisBot: Linux host.\nOld provider ranking from 2025.\n",
+                           encoding="utf-8")
+            with patch.object(mo, "MEMORY_FILE", mem):
+                entries = mo.read_memory_file()
+                assert entries == ["IrisBot: Linux host.", "Old provider ranking from 2025."]
+                used, _ = mo.get_memory_usage()
+                assert used == sum(len(e) for e in entries)
