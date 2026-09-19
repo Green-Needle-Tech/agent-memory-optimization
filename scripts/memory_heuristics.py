@@ -139,7 +139,7 @@ PROTECTED_VALUE_PATTERNS = (
     ("url", re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE), 0),
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), 0),
     ("ip", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), 0),
-    ("port", re.compile(r"\bport\s*(?:is|=:|=|:)?\s*(\d{2,5})\b", re.IGNORECASE), 1),
+    ("port", re.compile(r"\bport(?:\s+is\s+|\s*:\s*=\s*|\s*=\s*|\s*:\s*|\s+)(\d{2,5})\b", re.IGNORECASE), 1),
     ("semver", re.compile(r"\bv?\d+\.\d+(?:\.\d+)?(?:[-+][\w.-]+)?\b"), 0),
     ("model", re.compile(
         r"\b(?:gpt|glm|claude|gemini|gemma|llama|mistral|qwen|deepseek|gpt-oss)[\w.-]*\b",
