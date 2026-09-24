@@ -27,6 +27,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import daily_memory_optimization
+import memory_heuristics
 import memory_offload
 import memory_records
 
@@ -49,6 +50,104 @@ class TestMemoryOffloadHelpers:
         assert len(offloadable) == 1
         assert "IrisBot" in essential[0]
         assert "Random fact" in offloadable[0]
+
+
+# ============================================================================
+# v3.7 — Least-essential fallback
+# ============================================================================
+
+def _decision(index, disposition, score, rules):
+    return memory_heuristics.ImportanceDecision(
+        index=index, disposition=disposition, score=score,
+        matched_rules=rules, reason="test")
+
+
+class TestLeastEssentialFallback:
+    def _patch_detailed(self, decisions):
+        return patch.object(
+            memory_offload.memory_heuristics, "classify_importance_detailed",
+            return_value=decisions)
+
+    def test_candidates_exclude_hard_keeps(self):
+        entries = ["EAT DB: hard kept prefix", "Pinned entry [pin]",
+                   "soft essential one", "soft essential two"]
+        decisions = [
+            _decision(0, "essential", 100, ("RULE_ESSENTIAL_PREFIX",)),
+            _decision(1, "essential", 100, ("RULE_EXPLICIT_PIN",)),
+            _decision(2, "essential", 5, ("RULE_WEIGHTED",)),
+            _decision(3, "essential", 8, ("RULE_JEV_IMPORTANCE",)),
+        ]
+        with self._patch_detailed(decisions):
+            cands = memory_offload.least_essential_candidates(entries)
+        assert [i for i, _ in cands] == [2, 3]  # hard keeps excluded, score asc
+
+    def test_candidates_quarantined_and_offloadable_excluded(self):
+        entries = ["secret-like content", "offloadable entry", "soft essential"]
+        decisions = [
+            _decision(0, "quarantined", 0, ("RULE_QUARANTINE",)),
+            _decision(1, "offloadable", -100, ("RULE_TAG",)),
+            _decision(2, "essential", 4, ("RULE_WEIGHTED",)),
+        ]
+        with self._patch_detailed(decisions):
+            cands = memory_offload.least_essential_candidates(entries)
+        assert [i for i, _ in cands] == [2]
+
+    def test_candidates_longest_first_on_score_tie(self):
+        entries = ["short soft", "a much longer soft essential entry that scores the same"]
+        decisions = [
+            _decision(0, "essential", 5, ("RULE_WEIGHTED",)),
+            _decision(1, "essential", 5, ("RULE_WEIGHTED",)),
+        ]
+        with self._patch_detailed(decisions):
+            cands = memory_offload.least_essential_candidates(entries)
+        assert [i for i, _ in cands] == [1, 0]  # longest first frees most capacity
+
+    def test_fallback_moves_soft_entries_until_target(self):
+        entries = ["hard [pin]", "soft one", "soft two"]
+        decisions = [
+            _decision(0, "essential", 100, ("RULE_EXPLICIT_PIN",)),
+            _decision(1, "essential", 5, ("RULE_WEIGHTED",)),
+            _decision(2, "essential", 9, ("RULE_WEIGHTED",)),
+        ]
+        kept = list(entries)
+        safe = []
+        with self._patch_detailed(decisions), \
+             patch.object(memory_offload, "_offload_entry", return_value=True):
+            moved = memory_offload._least_essential_fallback(
+                entries, kept, safe, capacity=30, dry_run=True)
+        assert moved == ["soft one"]          # least essential moved first
+        assert "soft one" not in kept
+        assert "hard [pin]" in kept and "soft two" in kept
+        assert safe == ["soft one"]
+
+    def test_fallback_keeps_entry_on_failed_retain(self):
+        entries = ["soft one", "soft two"]
+        decisions = [
+            _decision(0, "essential", 5, ("RULE_WEIGHTED",)),
+            _decision(1, "essential", 9, ("RULE_WEIGHTED",)),
+        ]
+        kept = list(entries)
+        safe = []
+        with self._patch_detailed(decisions), \
+             patch.object(memory_offload, "_offload_entry", return_value=False):
+            moved = memory_offload._least_essential_fallback(
+                entries, kept, safe, capacity=100, dry_run=True)
+        assert moved == []
+        assert kept == entries                # nothing lost on retain failure
+        assert safe == []
+
+    def test_fallback_noop_when_under_target(self):
+        entries = ["soft one"]
+        decisions = [_decision(0, "essential", 5, ("RULE_WEIGHTED",))]
+        kept = list(entries)
+        safe = []
+        with self._patch_detailed(decisions), \
+             patch.object(memory_offload, "_offload_entry", return_value=True) as off:
+            moved = memory_offload._least_essential_fallback(
+                entries, kept, safe, capacity=1000, dry_run=True)
+        assert moved == []
+        off.assert_not_called()
+        assert kept == entries
 
     def test_stable_document_id_deterministic(self):
         """Same content should always produce the same document_id."""

@@ -1,6 +1,6 @@
 # agent-memory-optimization — Specification
 
-Version: 3.6.3 (Sep 2026) · Author: Liew Wei Sung · License: MIT
+Version: 3.7.0 (Sep 2026) · Author: Liew Wei Sung · License: MIT
 Repo: https://github.com/Green-Needle-Tech/agent-memory-optimization
 
 A Hermes Agent skill for maintaining a three-layer AI agent memory system: **L1** local always-injected memory (MEMORY.md / USER.md, ~2-4 KB), **L2** semantic recall (Hindsight, localhost:8888), **L3** compiled knowledge (Karpathy-pattern LLM Wiki / OKF bundle). Maintenance is grounded in 2026 agent-memory research: consolidation policy — importance, merge, decay, eviction — is where production memory systems fail, not retrieval.
@@ -11,7 +11,7 @@ A Hermes Agent skill for maintaining a three-layer AI agent memory system: **L1*
 |---|---|
 | `scripts/memory_heuristics.py` | Deterministic rule engine (stdlib only): L1 entry parsing (per-entry, never bulk), importance classification (hard rules + weighted scoring), semantic dedup, contradiction detection, audit logging, dry-run |
 | `scripts/llm_judge.py` | Scoped TypeSafe Jev judge (System One, `jev-1.13.0`): importance refinement + veto-only offload gate, confidence-gated, fail-safe |
-| `scripts/memory_offload.py` | Transactional L1 → L2 offload (cron, 30 min): rules gate first, Jev confirms/vetoes, entry removed only after durable L2 retention |
+| `scripts/memory_offload.py` | Transactional L1 → L2 offload (cron, 30 min): rules gate first, Jev confirms/vetoes, entry removed only after durable L2 retention. v3.7: least-essential fallback offloads soft essentials (no hard-keep rule) when over threshold and nothing is rule-offloadable — until usage <= `OFFLOAD_TARGET`; hard keeps (essential prefixes, `[pin]`, quarantined) are never touched |
 | `scripts/daily_memory_optimization.py` | No-agent daily cron: L2 consolidation + smoke-tests, dedup/contradiction passes, Knowledge Pages health, L1 capacity, L3 lint, rule-based auto-resolve, Telegram notify |
 | `scripts/memory_records.py` | Record normalization, PII redaction, sensitive-entry exclusion, paginated scan batches |
 | `scripts/paths.py` | Location-aware resolution (HERMES_HOME, Hindsight URL/bank, .env values, WIKI_DIR) from the existing deployment |
@@ -102,6 +102,8 @@ flowchart TD
     class QUAR,ESS1,ESS2,OFF1,RULEV,RECL,OFFALL,OFFOK,VETO act
     class ENTRY,KEEP,L2 done
 ```
+
+**v3.7 least-essential fallback (offload-time, not per-entry):** after the per-entry gate runs, `memory_offload._do_offload` checks usage. If still above `OFFLOAD_THRESHOLD` (nothing was rule-offloadable, or the offloadable set wasn't enough), `least_essential_candidates()` selects **soft essentials** — entries classified essential with NO hard-keep rule (`RULE_ESSENTIAL_PREFIX`, `RULE_EXPLICIT_PIN`; quarantined entries are excluded as non-essential) — ranked by score ascending, then longest-first. Entries are transactionally retained to L2 and removed from L1 until usage <= `OFFLOAD_TARGET` (env, default = threshold). Hard-kept entries are never returned by the candidate function, so the fallback structurally cannot touch them. Audit rule id: `LEAST_ESSENTIAL_FALLBACK`.
 
 ## 4. Jev judge contract
 

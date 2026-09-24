@@ -1,7 +1,7 @@
 ---
 name: memory-optimization
 description: "Optimize L1/L2/L3 memory: prune, offload, dedup, lint."
-version: 3.6.3
+version: 3.7.0
 author: Iris
 license: MIT
 trigger: >-
@@ -17,6 +17,10 @@ metadata:
 ---
 
 # Three-Layer Memory Optimization (L1 / L2 / L3)
+
+## v3.7 — Least-Essential Fallback (Sep 2026)
+
+`memory_offload.py` no longer exits when MEMORY.md is over threshold but every entry is classified essential. A fallback tier now offloads the **least-essential soft essentials** to L2 until usage <= `OFFLOAD_TARGET` (env `OFFLOAD_TARGET`, default = `OFFLOAD_THRESHOLD`). Soft essentials are entries classified essential WITHOUT a hard-keep rule (kept by weighted scoring or Jev reclassification), ranked by score ascending then longest-first (max capacity freed per move). **Hard keeps are never touched**: essential prefixes (`memory_heuristics.json`), `[pin]` markers, and quarantined (secret-like) entries — the 2026-09-03 auto-wipe incident cannot recur. Same transactional safety: removed from L1 only after confirmed L2 presence or successful retain; failed retains keep the entry locally. Audit rule id: `LEAST_ESSENTIAL_FALLBACK`.
 
 ## v3.6.3 — Per-Entry L1 Parsing (Sep 2026)
 

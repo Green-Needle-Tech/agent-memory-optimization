@@ -5,6 +5,19 @@ Runs via cron (no_agent=True). When local MEMORY.md exceeds the capacity
 threshold, offloads non-essential entries to Hindsight and removes them
 from local memory.
 
+v3.7 (Sep 2026): Least-essential fallback.
+  - When MEMORY.md is over the threshold but no entry is rule-offloadable,
+    the script now moves the least-essential SOFT essential entries to L2
+    until usage <= OFFLOAD_TARGET (env OFFLOAD_TARGET, default = threshold)
+  - Soft essentials = classified essential WITHOUT a hard-keep rule (kept
+    by weighted scoring or Jev reclassification). Ranked by score
+    ascending, then longest-first (max capacity freed per offload)
+  - Hard keeps are NEVER touched by the fallback: essential prefixes
+    (memory_heuristics.json), [pin] markers, quarantined (secret-like)
+    entries — the 2026-09-03 incident cannot recur
+  - Same transactional safety: removed from L1 only after confirmed L2
+    presence or successful retain; failed retains keep the entry locally
+
 v3.6 (Sep 2026): TypeSafe Jev judge (System One, jev-1.13.0).
   - Replaces the OpenRouter chat-completions judge (v3.2) with TypeSafe
     System One structured decisions: state + typed choice questions ->
@@ -91,6 +104,12 @@ HINDSIGHT_URL = paths.resolve_hindsight_url(HERMES_HOME)
 BANK = paths.resolve_hindsight_bank(HERMES_HOME)
 CAPACITY_MAX = int(os.environ.get("MEMORY_CHARS", "2200"))  # chars
 OFFLOAD_THRESHOLD = float(os.environ.get("OFFLOAD_THRESHOLD", "0.75"))  # 75%
+# Post-offload target usage (v3.7): the least-essential fallback offloads
+# until usage <= this fraction of capacity. Defaults to the threshold.
+OFFLOAD_TARGET = float(os.environ.get("OFFLOAD_TARGET", str(OFFLOAD_THRESHOLD)))
+# Rules whose verdicts the least-essential fallback NEVER overrides (v3.7).
+# Entries matched by these stay in L1 unconditionally.
+HARD_KEEP_RULES = {"RULE_ESSENTIAL_PREFIX", "RULE_EXPLICIT_PIN"}
 LOCK_FILE = MEMORY_FILE.with_suffix(".lock")  # MEMORY.lock next to MEMORY.md
 BACKUP_DIR = MEMORY_FILE.parent / ".backups"
 MAX_BACKUPS = 5  # keep last N backups
@@ -351,6 +370,78 @@ def classify_entries(entries):
     return essential, offloadable
 
 
+def least_essential_candidates(entries):
+    """Rank 'soft' essential entries for the fallback offload (v3.7).
+
+    Soft essentials are entries classified essential WITHOUT a hard-keep
+    rule — i.e. kept by weighted scoring or by the Jev judge's
+    reclassification, not by an essential prefix, [pin] marker, or
+    quarantine. Hard-kept entries are never returned here, so the
+    fallback can never touch them (2026-09-03 incident protection).
+
+    Ranking: lowest score first (least essential), then longest entry
+    first (frees the most capacity per offload).
+    """
+    try:
+        decisions = memory_heuristics.classify_importance_detailed(entries)
+    except Exception:
+        return []
+    soft = []
+    for d in decisions:
+        if d.disposition != "essential":
+            continue  # offloadable/quarantined are handled elsewhere
+        if any(r in HARD_KEEP_RULES for r in (d.matched_rules or ())):
+            continue  # hard-kept: essential prefix or [pin] — untouchable
+        soft.append((d.score, -len(entries[d.index]), d.index))
+    soft.sort()
+    return [(i, entries[i]) for _, _, i in soft]
+
+
+def _least_essential_fallback(entries, entries_to_keep, safe_to_remove, capacity, dry_run):
+    """Offload least-essential soft entries until usage <= OFFLOAD_TARGET (v3.7).
+
+    Runs only when the file is still over OFFLOAD_THRESHOLD after the
+    normal rule-offloadable pass (or when no entry was rule-offloadable at
+    all). Same transactional safety as the main pass: an entry is removed
+    from L1 only after confirmed L2 presence or a successful retain; a
+    failed retain leaves the entry in entries_to_keep untouched.
+    """
+    moved = []
+    def kept_usage_pct():
+        return sum(len(e) for e in entries_to_keep) / capacity
+
+    if kept_usage_pct() <= OFFLOAD_TARGET:
+        return moved
+
+    for _, entry in least_essential_candidates(entries):
+        if kept_usage_pct() <= OFFLOAD_TARGET:
+            break
+        if entry not in entries_to_keep:
+            continue
+        if _offload_entry(entry, get_tags(entry)):
+            entries_to_keep.remove(entry)
+            safe_to_remove.append(entry)
+            moved.append(entry)
+            print(
+                "FALLBACK: offloaded least-essential entry to L2 "
+                "(rule: LEAST_ESSENTIAL_FALLBACK)"
+            )
+            print(f"  Entry: {entry[:80]}")
+            if dry_run:
+                print("  (DRY RUN — MEMORY.md not rewritten)")
+        else:
+            print("FALLBACK: L2 retain failed — keeping entry in L1")
+            print(f"  Entry: {entry[:80]}")
+
+    if moved and kept_usage_pct() > OFFLOAD_TARGET:
+        print(
+            f"WARN: fallback exhausted soft candidates; still at "
+            f"{kept_usage_pct():.0%} (target {OFFLOAD_TARGET:.0%}) — "
+            f"remaining entries are hard-kept."
+        )
+    return moved
+
+
 def main():
     """Offload non-essential memory entries to Hindsight.
 
@@ -422,11 +513,6 @@ def _do_offload():
     # 4. Classify entries (rule-based)
     essential, offloadable = classify_entries(entries)
 
-    if not offloadable:
-        # All entries are essential but we're over capacity
-        print(f"WARN: Memory at {usage_pct:.0%} but all {len(entries)} entries are essential. Cannot offload.")
-        sys.exit(0)
-
     # 5. Transactional offload: track per-entry safety
     entries_to_keep = list(essential)
     safe_to_remove = []
@@ -447,6 +533,18 @@ def _do_offload():
                 print("DRY RUN: would keep entry in L1 (L2 retain failed)")
                 print("  Rule: OFFLOAD_RETAIN_FAILED")
                 print(f"  Entry: {entry[:80]}")
+
+    # 5b. Least-essential fallback (v3.7): if still over threshold (either
+    #     nothing was rule-offloadable, or the offloadable set wasn't enough),
+    #     move the least-essential SOFT essential entries to L2 until usage
+    #     <= OFFLOAD_TARGET. Hard-kept entries (essential prefixes, [pin],
+    #     quarantine) are never touched.
+    _least_essential_fallback(entries, entries_to_keep, safe_to_remove, capacity, dry_run)
+
+    if not safe_to_remove:
+        # Over threshold but nothing could be safely moved
+        print(f"WARN: Memory at {usage_pct:.0%}; no offloadable or soft-essential entries could be moved.")
+        sys.exit(0)
 
     # 6. Rewrite local memory: essential + FAILED entries (never lose data)
     #    Dry-run never rewrites MEMORY.md.

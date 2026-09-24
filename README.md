@@ -13,7 +13,7 @@ Long-running agents accumulate:
 
 This skill is the maintenance playbook: write-time importance filtering, semantic dedup passes, contradiction resolution (recency wins for state, flag-for-human for stable attributes), tiered TTL, and eviction-for-compliance-only.
 
-## v3.6.3 — Per-Entry L1 Parsing (Sep 2026)
+## v3.7.0 — Per-Entry L1 Parsing (Sep 2026)
 
 L1 MEMORY.md / USER.md content is now classified **per individual memory entry, never in bulk**. New shared parser `memory_heuristics.parse_l1_entries()` (used by `memory_offload.read_memory_file` / `get_memory_usage` and the daily script's USER.md prune) replaces the old inline `§`-only splitting. Previously, an L1 file without a `§` separator collapsed into a single bulk entry — the entire file was then classified as one unit, so a single hard-offload pattern could mark the whole file offloadable. Separator precedence:
 
